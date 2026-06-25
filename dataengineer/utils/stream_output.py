@@ -1,0 +1,465 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Unified streaming output component for CLI operations.
+
+Provides a consistent UI for displaying:
+- Progress bar
+- Current task/file being processed
+- Rolling message window (keeps last N lines)
+- LLM output (maximized visibility)
+"""
+
+import json
+import re
+from collections import deque
+from contextlib import contextmanager
+from typing import Optional
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn
+from rich.text import Text
+
+
+class StreamOutputManager:
+    """Unified streaming output manager for displaying task progress and large model output"""
+
+    def __init__(
+        self,
+        console: Console,
+        max_message_lines: int = 10,
+        show_progress: bool = True,
+        title: str = "Processing",
+    ):
+        """
+        Initialize output manager
+
+        Args:
+            console: Rich console instance
+            max_message_lines: Maximum number of lines in the message scrolling window (default 10 lines)
+            show_progress: Whether to display a progress bar
+            title: Progress bar title
+        """
+        self.console = console
+        self.max_message_lines = max_message_lines
+        self.show_progress = show_progress
+        self.title = title
+
+        # Progress bar will be created in start() based on total_items
+        self.progress: Optional[Progress] = None
+
+        # Message Queue (keep last N rows, auto-scroll)
+        self.messages = deque(maxlen=max_message_lines)
+
+        # Current task information
+        self.current_task = ""
+        self.current_file = ""
+        self.task_number = 0
+
+        # Live display
+        self.live: Optional[Live] = None
+        self.progress_task: Optional[TaskID] = None
+        self._is_running = False
+
+        # Store complete LLM output for markdown rendering (bounded to prevent memory growth)
+        self.full_output: deque[str] = deque(maxlen=500)
+
+        # Store extracted summary outputs separately for reliable rendering
+        self.summary_outputs: list[str] = []
+
+    def _create_progress(self, total_items: int) -> Progress:
+        """
+        Create progress bar based on total items count.
+
+        For single item (total_items <= 1), use spinner-only style without count.
+        For multiple items, use full progress bar with percentage and count.
+        """
+        if total_items <= 1:
+            # Single task mode: spinner + description only
+            return Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=self.console,
+                transient=False,
+            )
+        else:
+            # Multi-task mode: full progress bar with count
+            return Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("({task.completed}/{task.total})"),
+                console=self.console,
+                transient=False,
+            )
+
+    def start(self, total_items: int, description: Optional[str] = None):
+        """
+        Start the output manager
+
+        Args:
+            total_items: Total number of tasks
+            description: Progress bar description (optional)
+        """
+        if self._is_running:
+            return
+
+        # Create progress bar based on total_items count
+        self.progress = self._create_progress(total_items)
+
+        desc = description or self.title
+        self.progress_task = self.progress.add_task(desc, total=total_items)
+        self.live = Live(
+            self._render(),
+            console=self.console,
+            refresh_per_second=4,  # Moderate refresh rate
+            transient=False,
+        )
+        self.live.start()
+        self._is_running = True
+
+    def stop(self):
+        """Stop the output manager"""
+        if self.live and self._is_running:
+            self.live.stop()
+            self.live = None
+            self._is_running = False
+
+    def update_progress(self, advance: int = 1, description: Optional[str] = None):
+        """
+        Update the progress bar
+
+        Args:
+            advance: Progress increments
+            description: New description (optional)
+        """
+        if self.progress is not None and self.progress_task is not None:
+            self.progress.update(self.progress_task, advance=advance)
+            if description:
+                self.progress.update(self.progress_task, description=description)
+        self._refresh()
+
+    def set_progress(self, completed: int, description: Optional[str] = None):
+        """
+        Set the absolute value of the progress bar
+
+        Args:
+            completed: Completed quantity
+            description: New description (optional)
+        """
+        if self.progress is not None and self.progress_task is not None:
+            self.progress.update(self.progress_task, completed=completed)
+            if description:
+                self.progress.update(self.progress_task, description=description)
+        self._refresh()
+
+    def start_file(self, filepath: str, total_items: Optional[int] = None):
+        """
+        Start working on the file
+
+        Args:
+            filepath: File path
+            total_items: Total number of items in the file (optional)
+        """
+        self.current_file = filepath
+        self.messages.clear()
+        self.task_number = 0
+        if total_items:
+            self.add_message(f"Processing {total_items} items...", style="cyan")
+        self._refresh()
+
+    def complete_file(self, filepath: str):
+        """
+        Complete file processing
+
+        Args:
+            filepath: File path
+        """
+        self.current_file = ""
+        self._refresh()
+
+    def start_task(self, task_description: str):
+        """
+        Start working on the task
+
+        Args:
+            task_description: Mission description
+        """
+        self.task_number += 1
+        self.current_task = f"[{self.task_number}] {task_description}"
+        self._refresh()
+
+    def add_message(self, message: str, style: str = ""):
+        """
+        Add a message to a scrolling window (auto-scroll, keep only the most recent N lines)
+
+        Args:
+            message: Message content (supports multiple lines)
+            style: Rich Style (Optional)
+        """
+        if not message:
+            return
+
+        # Handle multi-line messages
+        lines = str(message).strip().splitlines()
+        for line in lines:
+            if line.strip():
+                self.messages.append((line, style))
+
+        self._refresh()
+
+    def add_llm_output(self, output: str):
+        """
+        Add LLM output (priority display, use special styles)
+
+        Also stores the complete output for later markdown rendering.
+
+        Args:
+            output: LLM output content
+        """
+        self.full_output.append(output)
+        self.add_message(output, style="white")
+
+    def complete_task(self, success: bool = True, message: str = ""):
+        """
+        Complete the current task
+
+        Args:
+            success: Whether it was successful or not
+            message: Complete the message
+        """
+        if message:
+            icon = "✓" if success else "✗"
+            style = "green" if success else "red"
+            self.add_message(f"{icon} {message}", style=style)
+        self.current_task = ""
+        self._refresh()
+
+    def error(self, message: str):
+        """
+        Display an error message
+
+        Args:
+            message: Error message
+        """
+        self.add_message(f"✗ {message}", style="bold red")
+
+    def warning(self, message: str):
+        """
+        Display a warning message
+
+        Args:
+            message: Warning message
+        """
+        self.add_message(f"⚠ {message}", style="yellow")
+
+    def success(self, message: str):
+        """
+        Displays a success message
+
+        Args:
+            message: Success message
+        """
+        self.add_message(f"✓ {message}", style="green")
+
+    def add_summary_content(self, content: str):
+        """
+        Add content for summary rendering only (not displayed in scrolling window).
+
+        Use this to store structured output summaries that should appear in the
+        final markdown summary panel but not in the real-time scrolling display.
+
+        Args:
+            content: Summary text to display in the final summary panel
+        """
+        self.summary_outputs.append(content)
+
+    def render_markdown_summary(self, title: str = "Summary", last_n: Optional[int] = None):
+        """
+        Render complete markdown output after task completion.
+
+        Uses directly stored summary outputs if available (from add_summary_content),
+        otherwise falls back to extracting from full LLM output.
+
+        Args:
+            title: Title for the summary panel
+            last_n: If specified, only show the last N markdown outputs (useful for batch processing)
+        """
+        # Prefer explicitly stored summary outputs
+        if self.summary_outputs:
+            markdown_outputs = list(self.summary_outputs)
+        elif self.full_output:
+            # Fallback: extract from full LLM output
+            full_text = "\n".join(self.full_output)
+            markdown_outputs = self._extract_all_markdown_outputs(full_text)
+        else:
+            return
+
+        if not markdown_outputs:
+            self.full_output.clear()
+            self.summary_outputs.clear()
+            return
+
+        # If last_n specified, only show the last N outputs
+        if last_n is not None and last_n > 0:
+            markdown_outputs = markdown_outputs[-last_n:]
+
+        # Combine outputs with separators
+        markdown_content = "\n\n---\n\n".join(markdown_outputs)
+
+        if markdown_content:
+            md = Markdown(markdown_content)
+            self.console.print(Panel(md, title=f"📋 {title}", border_style="green"))
+
+        # Clear after rendering
+        self.full_output.clear()
+        self.summary_outputs.clear()
+
+    def _extract_all_markdown_outputs(self, text: str) -> list[str]:
+        """
+        Extract all markdown content from LLM output.
+
+        Finds all JSON blocks with 'output' field and returns their values.
+        Falls back to returning the original text if no JSON is found.
+
+        Args:
+            text: Raw LLM output text
+
+        Returns:
+            List of extracted markdown content strings
+        """
+        outputs = []
+
+        # Find all JSON blocks containing 'output' field
+        # Use a more flexible pattern to match JSON objects
+        json_pattern = r'\{[^{}]*"output"\s*:\s*"[^"]*"[^{}]*\}'
+        matches = re.findall(json_pattern, text, re.DOTALL)
+
+        for match in matches:
+            try:
+                data = json.loads(match)
+                if data.get("output"):
+                    outputs.append(data["output"])
+            except json.JSONDecodeError:
+                continue
+
+        # If no JSON outputs found, return empty list (don't dump raw text as summary)
+        return outputs
+
+    def _render(self):
+        """Render the entire output interface"""
+        components = []
+
+        # 1. Progress bar (fixed at the top)
+        if self.show_progress and self.progress is not None and self.progress_task is not None:
+            components.append(self.progress)
+            components.append("")  # Empty line separation
+
+        # 2. Current file (if any)
+        if self.current_file:
+            file_panel = Panel(
+                Text(self.current_file, style="bold cyan"),
+                title="📁 Current File",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+            components.append(file_panel)
+
+        # 3. Current Task (if any)
+        if self.current_task:
+            components.append(Text(f"→ {self.current_task}", style="bold yellow"))
+
+        # 4. Message scrolling area (display up to N lines, auto-scrolling)
+        if self.messages:
+            message_lines = []
+            for msg, style in self.messages:
+                # Add indentation to make the output clearer
+                text = Text(f"  {msg}", style=style or "dim")
+                message_lines.append(text)
+
+            # Use Panel to wrap your message, providing a border and title
+            messages_panel = Panel(
+                Group(*message_lines),
+                title="💬 Output ",
+                border_style="blue",
+                padding=(0, 1),
+            )
+            components.append(messages_panel)
+
+        return Group(*components)
+
+    def _refresh(self):
+        """Refresh the display"""
+        if self.live and self._is_running:
+            self.live.update(self._render())
+
+    @contextmanager
+    def task_context(self, task_description: str):
+        """
+        Task context manager that automatically handles start and finish
+
+        Usage:
+            with output_mgr.task_context("Processing item"):
+                # do work
+                output_mgr.add_message("Step 1 done")
+                output_mgr.add_message("Step 2 done")
+            # Automatically marked as complete
+        """
+        self.start_task(task_description)
+        try:
+            yield self
+            self.complete_task(success=True)
+        except Exception as e:
+            self.complete_task(success=False, message=str(e))
+            raise
+
+    @contextmanager
+    def file_context(self, filepath: str, total_items: Optional[int] = None):
+        """
+        File processing context manager
+
+        Usage:
+            with output_mgr.file_context("data.sql", total_items=10):
+                for item in items:
+                    with output_mgr.task_context(f"Processing {item}"):
+                        # do work
+        """
+        self.start_file(filepath, total_items)
+        try:
+            yield self
+            self.complete_file(filepath)
+        except Exception:
+            self.complete_file(filepath)
+            raise
+
+
+def create_stream_output_manager(
+    console: Console,
+    max_message_lines: int = 10,
+    show_progress: bool = True,
+    title: str = "Processing",
+) -> StreamOutputManager:
+    """
+    Create a factory function for the Streaming Output Manager
+
+    Args:
+        console: Rich console instance
+        max_message_lines: The maximum number of lines in the message scroll window
+        show_progress: Whether a progress bar is displayed
+        title: Progress bar title
+
+    Returns:
+        StreamOutputManager instance
+    """
+    return StreamOutputManager(
+        console=console,
+        max_message_lines=max_message_lines,
+        show_progress=show_progress,
+        title=title,
+    )
