@@ -1,0 +1,15 @@
+SQL task: {{sql_task}}
+
+SQL context: {{sql_context}}
+
+Table schemas: {{schemas}}
+
+External docs: {{docs}}
+
+Use the SQL dialect to interpret the query, analyze the SQL query and the execution result, and consider the SQL task.
+Your job is to fix grammar errors in the query while preserving its original intent. 
+Output format: Return a JSON object with the following structure, *only JSON*:
+{
+  "sql": "sql you generate", 
+  "explanation" : "thinking step by step"
+} 

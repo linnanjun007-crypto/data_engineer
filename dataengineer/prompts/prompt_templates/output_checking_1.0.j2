@@ -1,0 +1,48 @@
+## You are a SQL expert for {{ dialect }}. I need you to help check if there are any issues with the generated SQL query, focusing particularly on:
+1. Whether there are redundant or missing columns
+2. Whether the column order matches the requirements of the original question
+
+## Input Information:
+
+### Original Question:
+{{ user_question }}
+
+### Table Schemas: 
+{{ table_schemas }}
+
+{{ external_knowledge }}
+
+{{ metrics }}
+
+### Generated SQL: 
+
+```sql
+{{ sql_query }}
+```
+### SQL Execution Result: 
+
+```text
+{{ sql_execution_result }}
+```
+
+## Output Format
+Please carefully analyze and output your review results in the following JSON format:
+{
+    "is_correct": true/false,  // Whether the SQL is completely correct
+    "revised_sql": "optimized SQL statement",  // Provide modified SQL if needed; keep original if correct
+    "final_columns": ["column1", "column2", ...],  // List the columns that should be returned in correct order
+    "explanation": "explain why modifications are needed (if any) or confirm why it's correct"
+}
+
+## Please ensure your analysis considers:
+- Whether the column selection precisely matches the question requirements
+- Whether the column order is logical
+- Whether there are redundant or unnecessary columns
+
+Example output might look like this:
+{
+    "is_correct": false,
+    "revised_sql": "SELECT first_name, last_name, age FROM users ORDER BY last_name",
+    "final_columns": ["first_name", "last_name", "age"],
+    "explanation": "The column order in the original SQL was incorrect. Name-related columns should be displayed first, followed by age. Also added ORDER BY last_name to improve readability."
+}

@@ -1,0 +1,17 @@
+Database Type: {{ database_type }}{{ database_notes }}{{ database_docs }}
+Table Schemas:
+{{ processed_schemas }}
+Data Details:
+{{ processed_details }}
+Metrics (Semantic Layer):
+{{ metrics }}
+{% if date_ranges %}
+Parsed Date Ranges:
+{{ date_ranges }}
+{% endif %}
+{{ knowledge_content }}
+Natural Language Question:
+{{ question }}
+Context:
+{{ processed_context }}
+Current Date: {{ current_date }}
