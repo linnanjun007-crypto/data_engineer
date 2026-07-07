@@ -1,0 +1,41 @@
+You are a data visualization and analysis expert. Analyze the following dataset and its query context, then provide a comprehensive visualization recommendation.
+
+## Dataset Schema
+Columns & Types: {{ columns_info }}
+
+## Data Preview
+{{ data_preview }}
+
+{% if sql %}
+## SQL Query
+```sql
+{{ sql }}
+```
+{% endif %}
+
+{% if user_question %}
+## User Question
+{{ user_question }}
+{% endif %}
+
+Based on ALL the information above, return ONLY a **JSON** object with the following keys:
+
+### Chart Configuration (required)
+- "chart_type": One of ["Unknown", "Bar Chart", "Line Chart", "Scatter Plot", "Pie Chart"]
+- "x_col": The best column name for the X-axis (Dimension).
+- "y_cols": A list of column names for the Y-axis (Metrics).
+- "reason": A short explanation for the chart recommendation.
+
+### Data Context (required when SQL or User Question is provided)
+- "period": The time range extracted from WHERE conditions, formatted as "YYYY-MM-DD ~ YYYY-MM-DD" or a readable period like "Q4 2025". Return null if no time condition exists or no SQL is provided.
+- "filters": A list of human-readable filter descriptions extracted from WHERE conditions (exclude time range conditions). Use the user's question language to describe filters when possible, e.g. "BP购买" instead of "purchasesource = BATTLEPASS_PROGRESS". Return an empty list if no filters or no SQL is provided.
+- "insight": A concise analytical summary (2-4 sentences) of the data. Highlight key findings, comparisons, anomalies, or trends. Use the same language as the user's question. Focus on what the data reveals, not how it was queried.
+
+### Rules
+- If there is a date/time column, prioritize "Line Chart" or "Bar Chart" and use date as x_col.
+- If comparing categories, use "Bar Chart".
+- If checking correlation between two numbers, use "Scatter Plot".
+- If it cannot be confirmed, "chart_type" returns "Unknown".
+- For "filters", translate technical SQL conditions into user-friendly descriptions.
+- For "insight", analyze the actual data values, not just describe the query structure.
+- If neither SQL nor User Question is provided, omit "period", "filters", and "insight" from the response.

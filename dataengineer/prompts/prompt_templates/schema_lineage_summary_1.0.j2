@@ -1,0 +1,31 @@
+# Final Table Ranking and Exclusion Analysis
+
+## Objective
+Re-evaluate initially matched tables against the user's question to select the **most relevant tables** and categorize exclusion reasons for others.Current database dialect is {{ dialect }}.
+
+## Input Data
+1. User Question:{{ user_question }}
+2. Current Date: {{ current_date }}
+2. Preliminary Matches :
+
+{{ table_metadata }}
+
+## Output In JSON Format
+
+```json
+{
+  "matched": [
+    {
+      "table": "db.schema1.table1",
+      "score": 0.8,
+      "reasons": ["has 'order_date' field", "links to customers"]
+    }
+  ],
+  "unmatched": [
+    {
+      "table": "db.schema2.table2",
+      "reason": "no date/amount fields"
+    }
+  ]
+}
+``` 
