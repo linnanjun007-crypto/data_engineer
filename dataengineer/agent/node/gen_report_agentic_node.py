@@ -1,0 +1,678 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+GenReportAgenticNode implementation for generic report generation.
+
+This module provides a base implementation of AgenticNode focused on
+report generation with semantic and database tools. It can be used directly
+or extended by specialized report nodes like AttributionAgenticNode.
+"""
+
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
+
+from dataengineer.agent.node.agentic_node import AgenticNode
+from dataengineer.cli.execution_state import ExecutionInterrupted
+from dataengineer.configuration.agent_config import AgentConfig
+from dataengineer.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
+from dataengineer.schemas.gen_report_agentic_node_models import GenReportNodeInput, GenReportNodeResult
+from dataengineer.tools.func_tool import ContextSearchTools, DBFuncTool, FilesystemFuncTool
+from dataengineer.tools.func_tool.semantic_tools import SemanticTools
+from dataengineer.utils.loggings import get_logger
+from dataengineer.utils.message_utils import MessagePart, build_structured_content
+
+logger = get_logger(__name__)
+
+
+class GenReportAgenticNode(AgenticNode):
+    """
+    Generic report generation agentic node.
+
+    This node provides a flexible base for report generation with:
+    - Configuration-based tool setup (semantic_tools.*, db_tools.*)
+    - Common streaming execution logic
+    - Template context building
+    - Result extraction framework
+
+    Can be instantiated directly or extended by specialized nodes.
+    """
+
+    NODE_NAME = "gen_report"
+
+    # Default tools when not configured in agent.yml
+    DEFAULT_TOOLS = "semantic_tools.*, context_search_tools.list_subject_tree"
+
+    def __init__(
+        self,
+        node_id: str,
+        description: str,
+        node_type: str,
+        input_data: Optional[GenReportNodeInput] = None,
+        agent_config: Optional[AgentConfig] = None,
+        tools: Optional[list] = None,
+        node_name: Optional[str] = None,
+        execution_mode: Literal["interactive", "workflow"] = "interactive",
+        scope: Optional[str] = None,
+        is_subagent: bool = False,
+    ):
+        """
+        Initialize the GenReportAgenticNode.
+
+        Args:
+            node_id: Unique identifier for the node
+            description: Human-readable description of the node
+            node_type: Type of the node
+            input_data: Report generation input data
+            agent_config: Agent configuration
+            tools: List of tools (will be populated in setup_tools)
+            node_name: Name of the node configuration in agent.yml
+            execution_mode: Execution mode - "interactive" (default) or "workflow"
+            is_subagent: When True, skip SubAgentTaskTool setup (2-level depth enforcement)
+        """
+        self.execution_mode = execution_mode
+        # Determine node name from node_type if not provided
+        self.configured_node_name = node_name
+
+        self.max_turns = 30
+        if agent_config and hasattr(agent_config, "agentic_nodes") and node_name in agent_config.agentic_nodes:
+            agentic_node_config = agent_config.agentic_nodes[node_name]
+            if isinstance(agentic_node_config, dict):
+                self.max_turns = agentic_node_config.get("max_turns", 30)
+
+        # Initialize tool attributes BEFORE calling parent constructor
+        # This is required because parent's __init__ calls _get_system_prompt()
+        # which may reference these attributes
+        self.db_func_tool: Optional[DBFuncTool] = None
+        self.semantic_tools: Optional[SemanticTools] = None
+        self.context_search_tools: Optional[ContextSearchTools] = None
+        self.filesystem_func_tool: Optional[FilesystemFuncTool] = None
+
+        # Call parent constructor with all required Node parameters
+        super().__init__(
+            node_id=node_id,
+            description=description,
+            node_type=node_type,
+            input_data=input_data,
+            agent_config=agent_config,
+            tools=tools or [],
+            mcp_servers={},  # No MCP servers for report nodes by default
+            scope=scope,
+            is_subagent=is_subagent,
+        )
+
+        # Setup tools based on configuration (includes subagent task tool wiring)
+        self.setup_tools()
+
+        # Setup ask_user tool for clarification questions (interactive mode only)
+        if self.execution_mode == "interactive":
+            self._setup_ask_user_tool()
+
+        logger.debug(f"GenReportAgenticNode tools: {len(self.tools)} tools - {[tool.name for tool in self.tools]}")
+
+    def get_node_name(self) -> str:
+        """
+        Get the configured node name for this report agentic node.
+
+        Returns:
+            The configured node name from agent.yml or NODE_NAME default
+        """
+        return self.configured_node_name or self.NODE_NAME
+
+    def setup_tools(self):
+        """
+        Setup tools based on configuration.
+
+        Reads 'tools' from node_config and sets up each tool pattern.
+        If no tools configured, self.tools remains empty.
+        """
+        if not self.agent_config:
+            return
+
+        self.tools = []
+
+        # Setup tools from configuration, falling back to DEFAULT_TOOLS
+        config_value = self.node_config.get("tools")
+        if config_value is None:
+            config_value = self.DEFAULT_TOOLS
+
+        tool_patterns = [p.strip() for p in config_value.split(",") if p.strip()]
+        for pattern in tool_patterns:
+            self._setup_tool_pattern(pattern)
+
+        # Ensure filesystem tools are always available (required for memory and file operations)
+        if not self.filesystem_func_tool:
+            self._setup_filesystem_tools()
+
+        # Rebuild subagent task tool so repeated setup_tools() calls (e.g. via
+        # ChatCommands.update_chat_node_tools after a datasource switch) keep the
+        # "task" tool available for delegation.
+        self._setup_sub_agent_task_tool()
+        if self.sub_agent_task_tool:
+            self.tools.extend(self.sub_agent_task_tool.available_tools())
+
+        logger.info(f"Setup {len(self.tools)} tools: {[tool.name for tool in self.tools]}")
+
+    def _setup_tool_pattern(self, pattern: str):
+        """
+        Setup tools based on pattern.
+
+        Supports patterns like:
+        - "semantic_tools.*" -> all semantic tools
+        - "db_tools.*" -> all db tools
+        - "context_search_tools.*" -> all context search tools
+        - "semantic_tools.search_metrics" -> specific method
+        - "db_tools.list_tables" -> specific method
+        - "context_search_tools.list_subject_tree" -> specific method
+        """
+        try:
+            # Handle wildcard patterns (e.g., "semantic_tools.*")
+            if pattern.endswith(".*"):
+                base_type = pattern[:-2]
+                if base_type == "semantic_tools":
+                    self._setup_semantic_tools()
+                elif base_type == "db_tools":
+                    self._setup_db_tools()
+                elif base_type == "context_search_tools":
+                    self._setup_context_search_tools()
+                elif base_type == "filesystem_tools":
+                    self._setup_filesystem_tools()
+                else:
+                    logger.warning(f"Unknown tool type: {base_type}")
+
+            # Handle exact type patterns
+            elif pattern == "semantic_tools":
+                self._setup_semantic_tools()
+            elif pattern == "db_tools":
+                self._setup_db_tools()
+            elif pattern == "context_search_tools":
+                self._setup_context_search_tools()
+            elif pattern == "filesystem_tools":
+                self._setup_filesystem_tools()
+
+            # Handle specific method patterns (e.g., "db_tools.describe_table")
+            elif "." in pattern:
+                tool_type, method_name = pattern.split(".", 1)
+                self._setup_specific_tool_method(tool_type, method_name)
+
+            else:
+                logger.warning(f"Unknown tool pattern: {pattern}")
+
+        except Exception as e:
+            logger.error(f"Failed to setup tool pattern '{pattern}': {e}")
+
+    def _setup_db_tools(self):
+        """Setup database tools."""
+        try:
+            self.db_func_tool = DBFuncTool(
+                agent_config=self.agent_config,
+                sub_agent_name=self.node_config.get("system_prompt"),
+            )
+            self.tools.extend(self.db_func_tool.available_tools())
+            logger.debug("Added database tools from DBFuncTool")
+        except Exception as e:
+            logger.error(f"Failed to setup database tools: {e}")
+
+    def _setup_semantic_tools(self):
+        """Setup semantic tools for report analysis."""
+        try:
+            # Get adapter_type from configuration
+            adapter_type = self.node_config.get("adapter_type", "metricflow")
+            self.semantic_tools = SemanticTools(
+                agent_config=self.agent_config,
+                sub_agent_name=self.node_config.get("system_prompt"),
+                adapter_type=adapter_type,
+            )
+            self.tools.extend(self.semantic_tools.available_tools())
+            logger.debug("Added semantic tools from SemanticTools")
+        except Exception as e:
+            logger.error(f"Failed to setup semantic tools: {e}")
+
+    def _setup_context_search_tools(self):
+        """Setup context search tools."""
+        try:
+            self.context_search_tools = ContextSearchTools(
+                self.agent_config, sub_agent_name=self.node_config.get("system_prompt")
+            )
+            self.tools.extend(self.context_search_tools.available_tools())
+            logger.debug("Added context search tools from ContextSearchTools")
+        except Exception as e:
+            logger.error(f"Failed to setup context search tools: {e}")
+
+    def _setup_filesystem_tools(self):
+        """Setup filesystem tools."""
+        try:
+            self.filesystem_func_tool = self._make_filesystem_tool()
+            self.tools.extend(self.filesystem_func_tool.available_tools())
+            logger.debug(f"Setup filesystem tools with root path: {self.filesystem_func_tool.root_path}")
+        except Exception as e:
+            logger.error(f"Failed to setup filesystem tools: {e}")
+
+    def _setup_specific_tool_method(self, tool_type: str, method_name: str):
+        """Setup a specific tool method."""
+        try:
+            if tool_type == "semantic_tools":
+                if not self.semantic_tools:
+                    adapter_type = self.node_config.get("adapter_type", "metricflow")
+                    self.semantic_tools = SemanticTools(
+                        agent_config=self.agent_config,
+                        sub_agent_name=self.node_config.get("system_prompt"),
+                        adapter_type=adapter_type,
+                    )
+                tool_instance = self.semantic_tools
+            elif tool_type == "db_tools":
+                if not self.db_func_tool:
+                    self.db_func_tool = DBFuncTool(
+                        agent_config=self.agent_config,
+                        sub_agent_name=self.node_config.get("system_prompt"),
+                    )
+                tool_instance = self.db_func_tool
+            elif tool_type == "context_search_tools":
+                if not self.context_search_tools:
+                    self.context_search_tools = ContextSearchTools(
+                        self.agent_config, sub_agent_name=self.node_config.get("system_prompt")
+                    )
+                tool_instance = self.context_search_tools
+            elif tool_type == "filesystem_tools":
+                if not self.filesystem_func_tool:
+                    self.filesystem_func_tool = self._make_filesystem_tool()
+                tool_instance = self.filesystem_func_tool
+            else:
+                logger.warning(f"Unknown tool type: {tool_type}")
+                return
+
+            if hasattr(tool_instance, method_name):
+                method = getattr(tool_instance, method_name)
+                from dataengineer.tools.func_tool import trans_to_function_tool
+
+                self.tools.append(trans_to_function_tool(method))
+                logger.debug(f"Added specific tool method: {tool_type}.{method_name}")
+            else:
+                logger.warning(f"Method '{method_name}' not found in {tool_type}")
+        except Exception as e:
+            logger.error(f"Failed to setup {tool_type}.{method_name}: {e}")
+
+    def _get_system_prompt(
+        self,
+        conversation_summary: Optional[str] = None,
+        prompt_version: Optional[str] = None,
+    ) -> str:
+        """
+        Get the system prompt for this report generation node.
+
+        Args:
+            conversation_summary: Optional summary from previous conversation compact
+            prompt_version: Optional prompt version to use
+
+        Returns:
+            System prompt string loaded from the template
+        """
+        context = {
+            "has_semantic_tools": bool(self.semantic_tools),
+            "has_db_tools": bool(self.db_func_tool),
+            "has_ask_user_tool": self.ask_user_tool is not None,
+            "has_task_tool": bool(self.sub_agent_task_tool),
+            "agent_config": self.agent_config,
+            "conversation_summary": conversation_summary,
+        }
+
+        # Add rules from configuration
+        context["rules"] = self.node_config.get("rules", [])
+
+        # Add agent description from configuration
+        context["agent_description"] = self.node_config.get("agent_description", "")
+
+        # Add datasource info
+        if self.agent_config:
+            from dataengineer.utils.node_utils import build_datasource_prompt_context
+
+            context.update(build_datasource_prompt_context(self.agent_config))
+            context["db_name"] = context.get("datasource")
+
+        from dataengineer.utils.time_utils import get_default_current_date
+
+        context["current_date"] = get_default_current_date(None)
+
+        version = None if prompt_version in (None, "") else str(prompt_version)
+
+        # Construct template name: {system_prompt}_system or fallback to {node_name}_system
+        system_prompt_name = self.node_config.get("system_prompt") or self.get_node_name()
+        template_name = f"{system_prompt_name}_system"
+
+        # Use prompt manager to render the template
+        from dataengineer.prompts.prompt_manager import get_prompt_manager
+
+        pm = get_prompt_manager(agent_config=self.agent_config)
+        try:
+            base_prompt = pm.render_template(template_name=template_name, version=version, **context)
+
+        except FileNotFoundError:
+            # Template not found - use default gen_report template
+            logger.warning(
+                f"Failed to render system prompt '{system_prompt_name}', using the default gen_report template"
+            )
+            base_prompt = pm.render_template(template_name="gen_report_system", version=version, **context)
+
+        return self._finalize_system_prompt(base_prompt)
+
+    def _build_enhanced_message(self, user_input: GenReportNodeInput) -> str:
+        """
+        Build enhanced message with context.
+
+        Base implementation adds database context. Subclasses can override
+        to add additional context specific to their report type.
+
+        Args:
+            user_input: Report node input
+
+        Returns:
+            Enhanced message string with context (structured JSON format)
+        """
+        enhanced_parts = []
+
+        if user_input.catalog:
+            enhanced_parts.append(f"Catalog : {user_input.catalog}")
+        # Add database context
+        if user_input.database:
+            enhanced_parts.append(f"Database context: {user_input.database}")
+        if user_input.db_schema:
+            enhanced_parts.append(f"Schema: {user_input.db_schema}")
+
+        if enhanced_parts:
+            enhanced_context = chr(10).join(enhanced_parts)
+            return build_structured_content(
+                [
+                    MessagePart(type="enhanced", content=enhanced_context),
+                    MessagePart(type="user", content=user_input.user_message),
+                ]
+            )
+
+        return user_input.user_message
+
+    def _extract_report_result(self, actions: List[ActionHistory]) -> Optional[Dict[str, Any]]:
+        """
+        Extract report result from tool call actions.
+
+        Subclasses can override this to extract specific tool results.
+
+        Args:
+            actions: List of action history entries
+
+        Returns:
+            Report result dict if found, None otherwise
+        """
+        # Base implementation returns None - subclasses should override
+        return None
+
+    def _extract_report_from_response(self, output: dict) -> tuple[str, Optional[Dict[str, Any]]]:
+        """
+        Extract report content and metadata from model response.
+
+        Per prompt template requirements, LLM should return JSON format:
+        {"report": "markdown content", "data_sources": [...], "key_findings": [...]}
+
+        Args:
+            output: Output dictionary from model generation
+
+        Returns:
+            Tuple of (report_markdown: str, metadata: Optional[Dict])
+            - report_markdown: The markdown report to display to user
+            - metadata: Additional metadata (data_sources, key_findings) or None
+        """
+        try:
+            from dataengineer.utils.json_utils import strip_json_str
+
+            # Check both 'content' and 'raw_output' fields (claude_model uses 'raw_output')
+            content = output.get("content", "") or output.get("raw_output", "") or output.get("response", "")
+            logger.debug(f"_extract_report_from_response input: {str(content)[:200]} (type: {type(content)})")
+
+            # Case 1: content is already a dict
+            if isinstance(content, dict):
+                report = content.get("report", "")
+                if report:
+                    metadata = {
+                        "data_sources": content.get("data_sources", []),
+                        "key_findings": content.get("key_findings", []),
+                    }
+                    logger.debug(f"Extracted from dict: report length={len(report)}")
+                    return report, metadata
+                else:
+                    # No report field, return content as-is
+                    logger.debug("Dict format but no 'report' field, returning raw content")
+                    return str(content), None
+
+            # Case 2: content is a JSON string (possibly wrapped in markdown code blocks)
+            elif isinstance(content, str) and content.strip():
+                # Use strip_json_str to handle markdown code blocks and extract JSON
+                cleaned_json = strip_json_str(content)
+                if cleaned_json:
+                    try:
+                        import json_repair
+
+                        parsed = json_repair.loads(cleaned_json)
+                        if isinstance(parsed, dict):
+                            report = parsed.get("report", "")
+                            if report:
+                                metadata = {
+                                    "data_sources": parsed.get("data_sources", []),
+                                    "key_findings": parsed.get("key_findings", []),
+                                }
+                                logger.debug(f"Extracted from JSON string: report length={len(report)}")
+                                return report, metadata
+                    except Exception as e:
+                        logger.warning(f"Failed to parse cleaned JSON: {e}. Returning raw content.")
+
+                # If JSON parsing failed or no report field, return original content
+                return content, None
+
+            # Fallback: return empty string if content is empty
+            logger.warning(f"Could not extract report from response. Content type: {type(content)}")
+            return str(content) if content else "", None
+
+        except Exception as e:
+            logger.error(f"Unexpected error extracting report: {e}", exc_info=True)
+            return "", None
+
+    async def execute_stream(
+        self, action_history_manager: Optional[ActionHistoryManager] = None
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """
+        Execute the report generation with streaming support.
+
+        Args:
+            action_history_manager: Optional action history manager
+
+        Yields:
+            ActionHistory: Progress updates during execution
+        """
+        if not action_history_manager:
+            action_history_manager = ActionHistoryManager()
+
+        # Get input from self.input
+        if not self.input:
+            raise ValueError("Report input not set. Call setup_input() first or set self.input directly.")
+
+        user_input = self.input
+
+        # Create initial action
+        action = ActionHistory.create_action(
+            role=ActionRole.USER,
+            action_type=self.get_node_name(),
+            messages=f"User: {user_input.user_message}",
+            input_data=user_input.model_dump(),
+            status=ActionStatus.PROCESSING,
+        )
+        action_history_manager.add_action(action)
+        yield action
+
+        try:
+            # Check for auto-compact before session creation
+            await self._auto_compact()
+
+            # Get or create session
+            session, conversation_summary = self._get_or_create_session()
+            prompt_version = getattr(user_input, "prompt_version", None) or self.node_config.get("prompt_version")
+            system_instruction = self._get_system_prompt(conversation_summary, prompt_version)
+
+            # Build enhanced message with context
+            enhanced_message = self._build_enhanced_message(user_input)
+
+            # Execute with streaming
+            response_content = ""
+            tokens_used = 0
+            last_successful_output = None
+
+            logger.debug(f"Tools available: {len(self.tools)} tools - {[tool.name for tool in self.tools]}")
+
+            # Stream response using model's generate_with_tools_stream
+            async for stream_action in self.model.generate_with_tools_stream(
+                prompt=enhanced_message,
+                tools=self.tools,
+                mcp_servers=self.mcp_servers,
+                instruction=system_instruction,
+                max_turns=self.max_turns,
+                session=session,
+                action_history_manager=action_history_manager,
+                agent_name=self.get_node_name(),
+                interrupt_controller=self.interrupt_controller,
+            ):
+                # Collect response content from successful actions
+                if stream_action.status == ActionStatus.SUCCESS and stream_action.output:
+                    if isinstance(stream_action.output, dict):
+                        last_successful_output = stream_action.output
+                        response_content = (
+                            stream_action.output.get("content", "")
+                            or stream_action.output.get("response", "")
+                            or stream_action.output.get("raw_output", "")
+                            or response_content
+                        )
+
+                        # Try to extract report from JSON and update action for display
+                        # This prevents raw JSON from being displayed in the stream
+                        if stream_action.role == ActionRole.ASSISTANT and response_content:
+                            # Check if response looks like JSON (contains {"report": pattern)
+                            is_json_response = '{"report"' in response_content or '"report":' in response_content
+                            if is_json_response:
+                                extracted_report, _ = self._extract_report_from_response(stream_action.output)
+                                if extracted_report:
+                                    # Update the action's output to show extracted report instead of raw JSON
+                                    stream_action.output["content"] = extracted_report
+                                    stream_action.output["response"] = extracted_report
+                                    stream_action.output["raw_output"] = extracted_report
+                                    response_content = extracted_report
+                                    # Also update messages field (used by action_history_display)
+                                    # Truncate for display, show first 200 chars with "..." if longer
+                                    preview = (
+                                        extracted_report[:200] + "..."
+                                        if len(extracted_report) > 200
+                                        else extracted_report
+                                    )
+                                    stream_action.messages = f"Report generated: {preview}"
+                                    logger.debug("Updated stream action with extracted report")
+
+                yield stream_action
+
+            # If we still don't have response_content, check the last successful output
+            if not response_content and last_successful_output:
+                response_content = (
+                    last_successful_output.get("content", "")
+                    or last_successful_output.get("text", "")
+                    or last_successful_output.get("response", "")
+                    or str(last_successful_output)
+                )
+
+            # Extract report markdown from JSON response (if LLM returned structured output)
+            report_metadata = None
+            if last_successful_output:
+                extracted_report, report_metadata = self._extract_report_from_response(last_successful_output)
+                if extracted_report:
+                    response_content = extracted_report
+                    logger.debug(f"Extracted report from JSON response, length={len(response_content)}")
+
+            # Extract report result from tool calls (subclass-specific)
+            all_actions = action_history_manager.get_actions()
+            report_result = self._extract_report_result(all_actions)
+
+            # Merge report metadata into report_result if available
+            if report_metadata and not report_result:
+                report_result = report_metadata
+
+            # Extract token usage
+            for action in reversed(all_actions):
+                if action.role == "assistant":
+                    if action.output and isinstance(action.output, dict):
+                        usage_info = action.output.get("usage", {})
+                        if usage_info and isinstance(usage_info, dict) and usage_info.get("total_tokens"):
+                            tokens_used = usage_info.get("total_tokens", 0)
+                            break
+
+            # Collect execution stats
+            tool_calls = [
+                action
+                for action in all_actions
+                if action.role == ActionRole.TOOL and action.status == ActionStatus.SUCCESS
+            ]
+            execution_stats = {
+                "total_actions": len(all_actions),
+                "tool_calls_count": len(tool_calls),
+                "tools_used": list(set([a.action_type for a in tool_calls])),
+                "total_tokens": int(tokens_used),
+            }
+
+            # Create final result
+            result = GenReportNodeResult(
+                success=True,
+                response=response_content,
+                report_result=report_result,
+                tokens_used=int(tokens_used),
+                action_history=[action.model_dump() for action in all_actions],
+                execution_stats=execution_stats,
+            )
+
+            # Add to internal actions list
+            self.actions.extend(all_actions)
+
+            # Create final action
+            final_action = ActionHistory.create_action(
+                role=ActionRole.ASSISTANT,
+                action_type=f"{self.get_node_name()}_response",
+                messages=f"{self.get_node_name()} analysis completed successfully",
+                input_data=user_input.model_dump(),
+                output_data=result.model_dump(),
+                status=ActionStatus.SUCCESS,
+            )
+            action_history_manager.add_action(final_action)
+            yield final_action
+
+        except ExecutionInterrupted:
+            raise
+
+        except Exception as e:
+            logger.error(f"{self.get_node_name()} execution error: {e}")
+
+            # Create error result
+            error_result = GenReportNodeResult(
+                success=False,
+                error=str(e),
+                response="Sorry, I encountered an error while generating the report.",
+                tokens_used=0,
+            )
+
+            # Update action with error
+            action_history_manager.update_current_action(
+                status=ActionStatus.FAILED,
+                output=error_result.model_dump(),
+                messages=f"Error: {str(e)}",
+            )
+
+            # Create error action
+            error_action = ActionHistory.create_action(
+                role=ActionRole.ASSISTANT,
+                action_type="error",
+                messages=f"{self.get_node_name()} analysis failed: {str(e)}",
+                input_data=user_input.model_dump(),
+                output_data=error_result.model_dump(),
+                status=ActionStatus.FAILED,
+            )
+            action_history_manager.add_action(error_action)
+            yield error_action
