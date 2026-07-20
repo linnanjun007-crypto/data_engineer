@@ -1,0 +1,1266 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Autocomplete module for DataEngineer CLI.
+Provides SQL keyword, table name, and column name autocompletion.
+"""
+
+import re
+from abc import abstractmethod
+from typing import Any, Dict, Iterable, List, Tuple, Union
+
+import pyarrow
+from prompt_toolkit.completion import Completer, Completion, PathCompleter
+from prompt_toolkit.document import Document
+from pygments.lexers.sql import SqlLexer
+from pygments.styles.default import DefaultStyle
+from pygments.token import Token
+
+from dataengineer.configuration.agent_config import AgentConfig
+from dataengineer.schemas.node_models import Metric, ReferenceSql, TableSchema
+from dataengineer.tools.db_tools import connector_registry
+from dataengineer.utils.constants import DBType
+from dataengineer.utils.loggings import get_logger
+from dataengineer.utils.path_utils import get_file_fuzzy_matches
+from dataengineer.utils.reference_paths import REFERENCE_PATH_REGEX, normalize_reference_path
+
+logger = get_logger(__name__)
+
+# Common SQL keywords and functions
+SQL_KEYWORDS = [
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "GROUP BY",
+    "HAVING",
+    "ORDER BY",
+    "JOIN",
+    "INNER JOIN",
+    "LEFT JOIN",
+    "RIGHT JOIN",
+    "FULL JOIN",
+    "LIMIT",
+    "OFFSET",
+    "UNION",
+    "UNION ALL",
+    "INTERSECT",
+    "EXCEPT",
+    "INSERT INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "DELETE FROM",
+    "CREATE TABLE",
+    "ALTER TABLE",
+    "DROP TABLE",
+    "TRUNCATE TABLE",
+    "CREATE INDEX",
+    "DROP INDEX",
+    "CREATE VIEW",
+    "DROP VIEW",
+    "WITH",
+    "AS",
+    "ON",
+    "USING",
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "LIKE",
+    "BETWEEN",
+    "IS NULL",
+    "IS NOT NULL",
+    "ASC",
+    "DESC",
+    "DISTINCT",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "EXISTS",
+    "ALL",
+    "ANY",
+]
+
+# Common SQL functions
+SQL_FUNCTIONS = [
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "COALESCE",
+    "NULLIF",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "EXTRACT",
+    "CAST",
+    "CONCAT",
+    "SUBSTRING",
+    "UPPER",
+    "LOWER",
+    "TRIM",
+    "LENGTH",
+    "ROUND",
+    "ABS",
+    "RANDOM",
+    "FLOOR",
+    "CEILING",
+    "POWER",
+    "SQRT",
+    "DATE_PART",
+    "TO_CHAR",
+    "TO_DATE",
+    "TO_NUMBER",
+    "NVL",
+    "DECODE",
+]
+
+# SQL data types
+SQL_TYPES = [
+    "INT",
+    "INTEGER",
+    "SMALLINT",
+    "BIGINT",
+    "DECIMAL",
+    "NUMERIC",
+    "FLOAT",
+    "REAL",
+    "DOUBLE PRECISION",
+    "BOOLEAN",
+    "CHAR",
+    "VARCHAR",
+    "TEXT",
+    "DATE",
+    "TIME",
+    "TIMESTAMP",
+    "INTERVAL",
+    "BLOB",
+    "BYTEA",
+    "UUID",
+    "JSON",
+    "JSONB",
+    "ARRAY",
+    "ENUM",
+]
+
+
+class SQLCompleter(Completer):
+    """SQL completer for prompt_toolkit."""
+
+    def __init__(self):
+        """Initialize the SQL completer."""
+        self.keywords = SQL_KEYWORDS.copy()
+        self.functions = SQL_FUNCTIONS.copy()
+        self.types = SQL_TYPES.copy()
+
+        # Tables and columns (populated dynamically)
+        self.tables: Dict[str, List[str]] = {}  # table_name -> [column1, column2, ...]
+        self.table_aliases: Dict[str, str] = {}  # alias -> original_table
+
+        # Metadata about the database
+        self.database_name = ""
+        self.schema_name = ""
+
+        # Command completions
+        self.commands = self._get_command_completions()
+        self.at_cmds = ["table", "metric"]
+
+    def _get_command_completions(self) -> Dict:
+        """Return tool-command prefixes for the fallback Word-style completer.
+
+        Slash commands are handled by :class:`SlashCommandCompleter` which
+        reads :data:`datus.cli.slash_registry.SLASH_COMMANDS` directly, so
+        they must not be duplicated here.
+        """
+
+        return {
+            # Tool commands (! prefix)
+            "!": None,
+            "!sl": None,
+            "!schema_linking": None,
+            "!sq": None,
+            "!search_sql": None,
+            "!sm": None,
+            "!search_metrics": None,
+            "!sd": None,
+            "!search_document": None,
+            "!save": None,
+            "!bash": None,
+        }
+
+    def update_tables(self, tables: Dict[str, List[str]]):
+        """
+        Update the tables and columns information.
+
+        Args:
+            tables: Dictionary mapping table names to column lists
+        """
+        self.tables = tables
+        # Reset aliases when tables are updated
+        self.table_aliases = {}
+
+    def update_db_info(self, database_name: str, schema_name: str):
+        """
+        Update database and schema context information.
+
+        Args:
+            database_name: Name of the current database
+            schema_name: Name of the current schema
+        """
+        self.database_name = database_name
+        self.schema_name = schema_name
+
+    def _detect_aliases(self, text: str):
+        """
+        Detect table aliases in the SQL query.
+
+        Args:
+            text: SQL query text
+        """
+        # Simple regex would work for basic cases, but we'll use a basic split approach
+        lines = text.split("\n")
+        for line in lines:
+            # Look for FROM and JOIN clauses with aliases
+            if "FROM" in line.upper() or "JOIN" in line.upper():
+                parts = line.split()
+                for i in range(len(parts) - 2):
+                    if parts[i].upper() in ("FROM", "JOIN") and i + 2 < len(parts):
+                        table_name = parts[i + 1].strip(",")
+                        # Check if next token is an alias
+                        if parts[i + 2] not in (
+                            "ON",
+                            "WHERE",
+                            "GROUP",
+                            "ORDER",
+                            "HAVING",
+                            "LIMIT",
+                            "OFFSET",
+                            "JOIN",
+                            "LEFT",
+                            "RIGHT",
+                        ):
+                            alias = parts[i + 2].strip(",")
+                            if table_name in self.tables:
+                                self.table_aliases[alias] = table_name
+
+        logger.debug(f"Detected aliases: {self.table_aliases}")
+
+    def get_completions(self, document: Document, complete_event=None) -> Iterable[Completion]:
+        """
+        Get completions for the current cursor position.
+
+        Args:
+            document: The document to complete
+            complete_event: Complete event (not used)
+
+        Returns:
+            Iterable of completions
+        """
+        text = document.text
+        if text.startswith("/"):
+            return
+        text = document.text_before_cursor
+        word_before_cursor = document.get_word_before_cursor(WORD=True)
+
+        logger.debug(f"Completion for: '{word_before_cursor}', text before: '{text}'")
+
+        # First check for command completions
+        if text.lstrip().startswith(("!", "@", ".")):
+            cmd_text = text.lstrip()
+            for cmd in self.commands:
+                if cmd.startswith(cmd_text):
+                    display = cmd
+                    yield Completion(cmd, start_position=-len(cmd_text), display=display, style="class:command")
+            return
+
+        # Detect aliases in the current query
+        self._detect_aliases(text)
+
+        # Check if we're after a dot (schema.table or table.column)
+        if "." in word_before_cursor:
+            parts = word_before_cursor.split(".")
+            if len(parts) >= 2:
+                prefix = parts[0]
+                # If prefix is a table name or alias, suggest columns
+                if prefix in self.tables or prefix in self.table_aliases:
+                    table = self.tables.get(prefix) or self.tables.get(self.table_aliases.get(prefix, ""))
+                    if table:
+                        for col in table:
+                            if col.startswith(parts[-1]) or not parts[-1]:
+                                yield Completion(
+                                    col,
+                                    start_position=-len(parts[-1]),
+                                    display=col,
+                                    style="class:column",
+                                )
+                return
+
+        # Check for FROM/JOIN context to suggest tables
+        prev_word = self._get_previous_word(text).upper()
+        if prev_word in ["FROM", "JOIN", "TABLE"]:
+            for table in self.tables:
+                if table.startswith(word_before_cursor) or not word_before_cursor:
+                    yield Completion(
+                        table,
+                        start_position=-len(word_before_cursor),
+                        display=table,
+                        style="class:table",
+                    )
+            return
+
+        # Suggest columns in SELECT, WHERE, GROUP BY, etc. contexts
+        if prev_word in ["SELECT", "WHERE", "ON", "BY", "HAVING", "ORDER", "SET", "UPDATE"]:
+            # First suggest all column names from all tables and aliases
+            for table, columns in self.tables.items():
+                for col in columns:
+                    if col.startswith(word_before_cursor) or not word_before_cursor:
+                        yield Completion(
+                            col,
+                            start_position=-len(word_before_cursor),
+                            display=f"{col} [{table}]",
+                            style="class:column",
+                        )
+
+            # Then suggest qualified column names for tables and aliases
+            for table in self.tables:
+                if table.startswith(word_before_cursor) or not word_before_cursor:
+                    yield Completion(
+                        f"{table}.",
+                        start_position=-len(word_before_cursor),
+                        display=f"{table}.",
+                        style="class:table",
+                    )
+            for alias, table in self.table_aliases.items():
+                if alias.startswith(word_before_cursor) or not word_before_cursor:
+                    yield Completion(
+                        f"{alias}.",
+                        start_position=-len(word_before_cursor),
+                        display=f"{alias}. → {table}",
+                        style="class:table",
+                    )
+            return
+
+        # Suggest keywords and functions for other contexts
+        if word_before_cursor:
+            for keyword in self.keywords:
+                if keyword.startswith(word_before_cursor.upper()):
+                    yield Completion(
+                        keyword,
+                        start_position=-len(word_before_cursor),
+                        display=keyword,
+                        style="class:keyword",
+                    )
+
+            for func in self.functions:
+                if func.startswith(word_before_cursor.upper()):
+                    yield Completion(
+                        f"{func}(",
+                        start_position=-len(word_before_cursor),
+                        display=f"{func}()",
+                        style="class:function",
+                    )
+
+    def _get_previous_word(self, text: str) -> str:
+        """
+        Get the previous word in the text.
+
+        Args:
+            text: Text to analyze
+
+        Returns:
+            Previous word
+        """
+        text = text.strip()
+        if not text:
+            return ""
+
+        words = text.split()
+        if len(words) < 2:
+            return ""
+
+        return words[-2]
+
+
+class CustomSqlLexer(SqlLexer):
+    """Custom lexer extending SqlLexer for @references with space separator."""
+
+    tokens = {
+        "root": [
+            (rf"@Table(?:\s+{REFERENCE_PATH_REGEX})?", Token.AtTables),
+            (rf"@Metrics(?:\s+{REFERENCE_PATH_REGEX})?", Token.AtMetrics),
+            (rf"@Sql(?:\s+{REFERENCE_PATH_REGEX})?", Token.AtReferenceSql),
+            (r"@File(?:\s+[^\r\n@]+)?", Token.AtFiles),
+        ]
+        + SqlLexer.tokens["root"],
+    }
+
+
+class CustomPygmentsStyle(DefaultStyle):
+    """Custom style for coloring the @ references."""
+
+    styles = {
+        Token.AtTables: "#00CED1 bold",  # Pink
+        Token.AtMetrics: "#FFD700 bold",  # Gold
+        Token.AtReferenceSql: "#32CD32 bold",  # Green
+        Token.AtFiles: "ansiblue bold",  # Blue
+    }
+
+
+class DynamicAtReferenceCompleter(Completer):
+    def __init__(self, max_completions=10, quote_leaf=False):
+        self._data: Union[Dict[str, Any], List[str]] = {}
+        self.flatten_data: Dict[str, Any] = {}
+        self.max_level = 0
+        self.max_completions = max_completions
+        self.quote_leaf = quote_leaf
+        self._loaded = False
+
+    def clear(self):
+        self._data = {}
+        self.flatten_data = {}
+        self._loaded = False
+        self.max_level = 0
+
+    def _ensure_loaded(self):
+        if not self._loaded:
+            self._data = self.load_data()
+            self._loaded = True
+
+    def fuzzy_match(self, text: str) -> List[str]:
+        self._ensure_loaded()
+        text = text.strip().lower()
+        if not text:
+            return []
+        result = []
+        for k in self.flatten_data.keys():
+            if text in k.lower():
+                result.append(k)
+                if len(result) == 5:
+                    break
+        return result
+
+    @abstractmethod
+    def load_data(self) -> Union[List[str], Dict[str, Any]]:
+        raise NotImplementedError()
+
+    def reload_data(self):
+        self.flatten_data = {}
+        self._data = self.load_data()
+        self._loaded = True
+
+    def get_data(self):
+        self._ensure_loaded()
+        return self._data
+
+    def _format_leaf_for_completion(self, leaf: str) -> str:
+        """Wrap final component in quotes when required."""
+        if not self.quote_leaf or not leaf:
+            return leaf
+        trimmed = leaf.strip()
+        if trimmed.startswith('"') and trimmed.endswith('"') and len(trimmed) >= 2:
+            return trimmed
+        return f'"{trimmed}"'
+
+    def format_path_for_completion(self, path: str) -> str:
+        """Format full path when presenting completions."""
+        if not self.quote_leaf or not path:
+            return path
+        segments = path.split(".")
+        if not segments:
+            return path
+        segments[-1] = self._format_leaf_for_completion(segments[-1])
+        return ".".join(segments)
+
+    def get_completions(self, document, complete_event):
+        """Provide completions for specified type
+
+        Args:
+            document: Current document object
+            complete_event: Completion event
+        """
+        data = self.get_data()
+        rest = document.text
+        separator = "."
+        levels = rest.split(separator)
+        ends_with_sep = rest.endswith(separator)
+
+        if ends_with_sep:
+            prev_levels = levels[:-1]
+            prefix = ""
+            current_level = len(prev_levels) + 1
+        else:
+            prev_levels = levels[:-1]
+            prefix = levels[-1] if levels else ""
+            current_level = len(levels)
+        if current_level > self.max_level:
+            return
+        current_dict = data
+        for lvl in prev_levels:
+            current_dict = current_dict.get(lvl, {})
+            if not isinstance(current_dict, (dict, list)):
+                return
+        # Handle case where last level is a list
+        prefix_for_match = prefix.strip().lower()
+        if self.quote_leaf:
+            prefix_for_match = prefix_for_match.lstrip('"')
+        suggestions = [k for k in current_dict if k.lower().startswith(prefix_for_match)]
+        # Smart filtering: show more items when user types more characters
+        if len(prefix) >= 3:
+            # User typed enough characters, can show more options
+            effective_limit = min(self.max_completions + 5, len(suggestions))
+        else:
+            # User typed few characters, limit to avoid overwhelming
+            effective_limit = self.max_completions
+
+        is_last_level = current_level == self.max_level
+        suggestions = sorted(suggestions)[:effective_limit]
+        for s in suggestions:
+            completion_text = s
+
+            # The display text (what user sees in menu)
+            display_text = s
+            if not is_last_level:
+                display_text = f"{s}."
+            else:
+                completion_text = self._format_leaf_for_completion(s)
+                display_text = completion_text
+
+            if is_last_level and isinstance(current_dict, dict) and s in current_dict and current_dict[s]:
+                display_text = f"{display_text}: {current_dict[s]}"
+                if len(display_text) > 30:
+                    display_text = f"{display_text[:30]}..."
+
+            yield Completion(completion_text, display=display_text, start_position=-len(prefix))
+
+
+def insert_into_dict(data: Dict, keys: List[str], value: str) -> None:
+    """Helper function to insert values into a nested dictionary based on keys."""
+    temp = data
+    for key in keys[:-1]:
+        temp = temp.setdefault(key, {})
+    temp.setdefault(keys[-1], []).append(value)
+
+
+class TableCompleter(DynamicAtReferenceCompleter):
+    """Dynamic completer specifically for tables and metrics"""
+
+    def __init__(self, agent_config: AgentConfig, sqlite_show_db: bool = False, sub_agent_name: str = ""):
+        super().__init__()
+        self.agent_config = agent_config
+        self.sqlite_show_db = sqlite_show_db
+        self.sub_agent_name = sub_agent_name
+
+    def load_data(self) -> Union[List[str], Dict[str, Any]]:
+        from dataengineer.storage.schema_metadata.store import SchemaWithValueRAG
+
+        storage = SchemaWithValueRAG(self.agent_config, sub_agent_name=self.sub_agent_name or None)
+        try:
+            schema_table = storage.search_all_schemas(
+                select_fields=[
+                    "catalog_name",
+                    "database_name",
+                    "schema_name",
+                    "table_name",
+                    "table_type",
+                    "definition",
+                    "identifier",
+                ],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load table data: {e}")
+            schema_table = pyarrow.table([])
+        logger.debug(f"Load table data for completer: {len(schema_table)}")
+        if schema_table is None or schema_table.num_rows == 0:
+            return []
+
+        # Process schema table directly using pyarrow (no conversion to pylist)
+        table_column = schema_table["table_name"]
+
+        if self.agent_config.db_type == DBType.SQLITE and not self.sqlite_show_db:
+            self.max_level = 1
+            for table, definition, table_type in zip(
+                table_column, schema_table["definition"], schema_table["table_type"]
+            ):
+                self.flatten_data[table.as_py()] = {
+                    "table_name": table.as_py(),
+                    "table_type": table_type.as_py(),
+                    "definition": definition.as_py(),
+                }
+            return table_column.to_pylist()
+
+        catalog_column = schema_table["catalog_name"]
+        database_column = schema_table["database_name"]
+        schema_column = schema_table["schema_name"]
+        identifier_column = schema_table["identifier"]
+
+        data: Dict[str, Any] = {}
+
+        if connector_registry.support_catalog(self.agent_config.db_type) and catalog_column[0].as_py():
+            if connector_registry.support_database(self.agent_config.db_type):
+                if connector_registry.support_schema(self.agent_config.db_type):
+                    # catalog -> database -> schema -> table
+                    self.max_level = 4
+                    # Catalog -> Database -> Schema -> Table structure
+                    for catalog, database, schema, table, definition, table_type, identifier in zip(
+                        catalog_column,
+                        database_column,
+                        schema_column,
+                        table_column,
+                        schema_table["definition"],
+                        schema_table["table_type"],
+                        identifier_column,
+                    ):
+                        insert_into_dict(data, [catalog.as_py(), database.as_py(), schema.as_py()], table.as_py())
+                        self.flatten_data[f"{catalog}.{database}.{schema}.{table}"] = {
+                            "identifier": identifier.as_py(),
+                            "catalog_name": catalog.as_py(),
+                            "database_name": database.as_py(),
+                            "schema_name": schema.as_py(),
+                            "table_name": table.as_py(),
+                            "table_type": table_type.as_py(),
+                            "definition": definition.as_py(),
+                        }
+                    return data
+                else:
+                    # catalog -> database -> table
+                    self.max_level = 3
+                    for catalog, database, table, definition, table_type, identifier in zip(
+                        catalog_column,
+                        database_column,
+                        table_column,
+                        schema_table["definition"],
+                        schema_table["table_type"],
+                        identifier_column,
+                    ):
+                        insert_into_dict(data, [catalog.as_py(), database.as_py()], table.as_py())
+                        self.flatten_data[f"{catalog}.{database}.{table}"] = {
+                            "identifier": identifier.as_py(),
+                            "catalog_name": catalog.as_py(),
+                            "database_name": database.as_py(),
+                            "table_name": table.as_py(),
+                            "table_type": table_type.as_py(),
+                            "definition": definition.as_py(),
+                        }
+                    return data
+            elif connector_registry.support_schema(self.agent_config.db_type):
+                self.max_level = 3
+                # catalog -> schema -> table
+                for catalog, schema, table, definition, table_type, identifier in zip(
+                    catalog_column,
+                    schema_column,
+                    table_column,
+                    schema_table["definition"],
+                    schema_table["table_type"],
+                    identifier_column,
+                ):
+                    insert_into_dict(data, [catalog.as_py(), schema.as_py()], table.as_py())
+                    self.flatten_data[f"{catalog}.{schema}.{table}"] = {
+                        "identifier": identifier.as_py(),
+                        "catalog_name": catalog.as_py(),
+                        "schema_name": schema.as_py(),
+                        "table_name": table.as_py(),
+                        "table_type": table_type.as_py(),
+                        "definition": definition.as_py(),
+                    }
+
+        if (connector_registry.support_database(self.agent_config.db_type) or self.sqlite_show_db) and database_column[
+            0
+        ].as_py():
+            if connector_registry.support_schema(self.agent_config.db_type) and schema_column[0].as_py():
+                self.max_level = 3
+                # Database -> Schema -> Table structure
+                for database, schema, table, definition, table_type, identifier in zip(
+                    database_column,
+                    schema_column,
+                    table_column,
+                    schema_table["definition"],
+                    schema_table["definition"],
+                    identifier_column,
+                ):
+                    insert_into_dict(data, [database.as_py(), schema.as_py()], table.as_py())
+                    self.flatten_data[f"{database}.{schema}.{table}"] = {
+                        "identifier": identifier.as_py(),
+                        "database_name": database.as_py(),
+                        "schema_name": schema.as_py(),
+                        "table_name": table.as_py(),
+                        "table_type": table_type.as_py(),
+                        "definition": definition.as_py(),
+                    }
+            else:
+                self.max_level = 2
+                # Database -> Table structure
+                for database, table, definition, table_type, identifier in zip(
+                    database_column,
+                    table_column,
+                    schema_table["definition"],
+                    schema_table["table_type"],
+                    identifier_column,
+                ):
+                    insert_into_dict(data, [database.as_py()], table.as_py())
+                    self.flatten_data[f"{database}.{table}"] = {
+                        "identifier": identifier.as_py(),
+                        "database_name": database.as_py(),
+                        "table_name": table.as_py(),
+                        "table_type": table_type.as_py(),
+                        "definition": definition.as_py(),
+                    }
+            return data
+
+        if connector_registry.support_schema(self.agent_config.db_type):
+            self.max_level = 2
+            # schema -> table
+            for schema, table, definition, table_type, identifier in zip(
+                schema_column, table_column, schema_table["definition"], schema_table["table_type"], identifier_column
+            ):
+                insert_into_dict(data, [schema.as_py()], table.as_py())
+                self.flatten_data[f"{schema}.{table}"] = {
+                    "identifier": identifier.as_py(),
+                    "schema_name": schema.as_py(),
+                    "table_name": table.as_py(),
+                    "table_type": table_type.as_py(),
+                    "definition": definition.as_py(),
+                }
+
+        return data
+
+
+def insert_into_dict_with_dict(data: Dict, keys: List[str], leaf_key: str, value: str) -> None:
+    """Helper function to insert values into a nested dictionary based on keys."""
+    temp = data
+    for key in keys[:-1]:
+        temp = temp.setdefault(key, {})
+    temp.setdefault(keys[-1], {})[leaf_key] = value
+
+
+class MetricsCompleter(DynamicAtReferenceCompleter):
+    """Dynamic completer specifically for tables and metrics"""
+
+    def __init__(self, agent_config: AgentConfig, sub_agent_name: str = ""):
+        super().__init__(quote_leaf=True)
+        self.agent_config = agent_config
+        self.sub_agent_name = sub_agent_name
+
+    def load_data(self) -> Union[List[str], Dict[str, Any]]:
+        from dataengineer.storage.metric.store import MetricRAG
+
+        rag = MetricRAG(self.agent_config, sub_agent_name=self.sub_agent_name or None)
+        data = rag.search_all_metrics()
+        result = {}
+        max_depth = 0
+        for metric in data:
+            subject_path = metric.get("subject_path", [])
+            name = metric.get("name", "unknown")
+            description = metric.get("description", "")
+
+            # Build nested dict using subject_path
+            if subject_path:
+                insert_into_dict_with_dict(result, subject_path, name, description)
+                max_depth = max(max_depth, len(subject_path) + 1)
+
+            # Flatten key uses "/" separator
+            flatten_key = "/".join(subject_path + [name]) if subject_path else name
+            self.flatten_data[flatten_key] = {
+                "name": name,
+                "description": description,
+            }
+        self.max_level = max_depth or 4
+        return result
+
+
+class ReferenceSqlCompleter(DynamicAtReferenceCompleter):
+    def __init__(self, agent_config: AgentConfig, sub_agent_name: str = ""):
+        super().__init__(quote_leaf=True)
+        self.agent_config = agent_config
+        self.sub_agent_name = sub_agent_name
+
+    def load_data(self) -> Union[List[str], Dict[str, Any]]:
+        from dataengineer.storage.reference_sql.store import ReferenceSqlRAG
+
+        storage = ReferenceSqlRAG(self.agent_config, sub_agent_name=self.sub_agent_name or None)
+        search_data = storage.search_all_reference_sql()
+        result = {}
+        max_depth = 0
+        for item in search_data:
+            subject_path = item.get("subject_path", [])
+            name = item["name"]
+
+            # Build nested dict using subject_path
+            if subject_path:
+                insert_into_dict_with_dict(result, subject_path, name, item["summary"])
+                max_depth = max(max_depth, len(subject_path) + 1)
+
+            # Flatten key uses "/" separator
+            flatten_key = "/".join(subject_path + [name]) if subject_path else name
+            self.flatten_data[flatten_key] = {
+                "name": name,
+                "comment": item["comment"],
+                "summary": item["summary"],
+                "tags": item["tags"],
+                "sql": item["sql"],
+            }
+        self.max_level = max_depth or 4
+        return result
+
+
+class AtReferenceCompleter(Completer):
+    """Router completer: dispatch to different completers based on type"""
+
+    def __init__(self, agent_config: AgentConfig, sub_agent_name: str = "", available_subagents: set = None):
+        # Initialize specialized completers
+        self.agent_config = agent_config
+        self._sub_agent_name = sub_agent_name
+        self._available_subagents = available_subagents or set()
+        self.parser = AtReferenceParser()
+        self.table_completer = TableCompleter(agent_config, sub_agent_name=sub_agent_name)
+        self.metric_completer = MetricsCompleter(agent_config, sub_agent_name=sub_agent_name)
+        self.sql_completer = ReferenceSqlCompleter(agent_config, sub_agent_name=sub_agent_name)
+
+        # Get workspace_root from chat node configuration, then fall back to project_root
+        workspace_root = None
+        if hasattr(agent_config, "nodes") and "chat" in agent_config.nodes:
+            chat_node = agent_config.nodes["chat"]
+            if hasattr(chat_node, "input") and chat_node.input and hasattr(chat_node.input, "workspace_root"):
+                workspace_root = chat_node.input.workspace_root
+        if not workspace_root and hasattr(agent_config, "project_root"):
+            workspace_root = agent_config.project_root
+        if not workspace_root:
+            workspace_root = "."
+        self.workspace_root = workspace_root
+
+        def get_search_paths():
+            paths = []
+            # import os
+            # paths = [os.getcwd()]
+            if workspace_root:
+                paths.insert(0, workspace_root)
+            return paths
+
+        self.file_completer = PathCompleter(get_paths=get_search_paths)
+
+        self.completer_dict = {
+            "Table": self.table_completer,
+            "Metrics": self.metric_completer,
+            "Sql": self.sql_completer,
+            "File": self.file_completer,
+        }
+        self.type_options = {
+            "Table": "📊 Table",
+            "Metrics": "📈 Metrics",
+            "Sql": "💻 Sql",
+            "File": "📁 File",
+        }
+
+        self.at_parser = AtReferenceParser()
+
+    def set_sub_agent(self, sub_agent_name: str = "") -> None:
+        """Switch sub-agent context for all completers.
+
+        When set, completions are filtered to the sub-agent's scoped_context.
+        Pass empty string to reset to the full datasource scope.
+        """
+        if sub_agent_name == self._sub_agent_name:
+            return
+        self._sub_agent_name = sub_agent_name
+        self.table_completer.sub_agent_name = sub_agent_name
+        self.metric_completer.sub_agent_name = sub_agent_name
+        self.sql_completer.sub_agent_name = sub_agent_name
+        # Force reload on next completion
+        self.table_completer.clear()
+        self.metric_completer.clear()
+        self.sql_completer.clear()
+
+    def reload_data(self):
+        self.table_completer.reload_data()
+        self.metric_completer.reload_data()
+        self.sql_completer.reload_data()
+
+    def parse_at_context(self, user_input: str) -> Tuple[List[TableSchema], List[Metric], List[ReferenceSql]]:
+        self.table_completer._ensure_loaded()
+        self.metric_completer._ensure_loaded()
+        self.sql_completer._ensure_loaded()
+        user_input = user_input.strip()
+        if not user_input:
+            return ([], [], [])
+        parse_result = self.at_parser.parse_input(user_input)
+        tables = []
+        metrics = []
+        sqls = []
+        if parse_result["tables"]:
+            for key in parse_result["tables"]:
+                if key in self.table_completer.flatten_data:
+                    tables.append(TableSchema.from_dict(self.table_completer.flatten_data[key]))
+
+        if parse_result["metrics"]:
+            for key in parse_result["metrics"]:
+                if key in self.metric_completer.flatten_data:
+                    metrics.append(Metric.from_dict(self.metric_completer.flatten_data[key]))
+        if parse_result["sqls"]:
+            for key in parse_result["sqls"]:
+                if key in self.sql_completer.flatten_data:
+                    sqls.append(ReferenceSql.from_dict(self.sql_completer.flatten_data[key]))
+        return (tables, metrics, sqls)
+
+    def _detect_sub_agent_from_input(self, text: str) -> str:
+        """Detect sub-agent name from input line prefix like '/sub_agent_name ...'.
+
+        Only returns sub-agents that are configured for the current datasource.
+        """
+        if not text.startswith("/") or not self._available_subagents:
+            return ""
+        # Extract first token after /
+        stripped = text[1:]  # remove leading /
+        space_pos = stripped.find(" ")
+        if space_pos == -1:
+            return ""
+        first_token = stripped[:space_pos]
+        if first_token not in self._available_subagents:
+            return ""
+        # Verify sub-agent is in current datasource
+        from dataengineer.schemas.agent_models import SubAgentConfig
+
+        raw_config = self.agent_config.sub_agent_config(first_token)
+        if raw_config:
+            sub_config = SubAgentConfig.model_validate(raw_config)
+            if sub_config.has_scoped_context() and not sub_config.is_in_datasource(
+                self.agent_config.current_datasource
+            ):
+                return ""
+        return first_token
+
+    def get_completions(self, document, complete_event) -> Iterable[Completion]:
+        if not document.text.startswith("/"):
+            return
+
+        # Dynamically switch sub-agent context based on input prefix
+        detected = self._detect_sub_agent_from_input(document.text)
+        if detected != self._sub_agent_name:
+            self.set_sub_agent(detected)
+
+        text = document.text_before_cursor
+        at_pos = text.rfind("@")
+
+        if at_pos == -1:
+            return
+
+        prefix = text[at_pos:]
+
+        if " " not in prefix[1:]:
+            # User is typing after @ without space, do fuzzy matching
+            type_prefix = prefix[1:]
+
+            if type_prefix:  # Only do fuzzy matching if there's text after @
+                # Get fuzzy matches from each completer (max 5 each)
+                table_matches = self.table_completer.fuzzy_match(type_prefix)
+                metric_matches = self.metric_completer.fuzzy_match(type_prefix)
+                sql_matches = self.sql_completer.fuzzy_match(type_prefix)
+                file_matches = get_file_fuzzy_matches(type_prefix, path=self.workspace_root, max_matches=5)
+                # Yield fuzzy match results first
+                for match in table_matches[:5]:
+                    # Extract the actual path from the match string
+                    formatted = self.table_completer.format_path_for_completion(match)
+                    display = f"📊 {formatted}"
+                    yield Completion(
+                        f"@Table {formatted}",  # Remove the @ from completion
+                        start_position=-len(prefix),
+                        display=display,
+                        style="class:fuzzy",
+                    )
+
+                for match in metric_matches[:5]:
+                    formatted = self.metric_completer.format_path_for_completion(match)
+                    display = f"📈 {formatted}"
+                    yield Completion(
+                        f"@Metrics {formatted}", start_position=-len(prefix), display=display, style="class:fuzzy"
+                    )
+
+                for match in sql_matches[:5]:
+                    formatted = self.sql_completer.format_path_for_completion(match)
+                    display = f"💻 {formatted}"
+                    yield Completion(
+                        f"@Sql {formatted}", start_position=-len(prefix), display=display, style="class:fuzzy"
+                    )
+
+                for file_path in file_matches:
+                    yield Completion(
+                        f"@File {file_path}",  # Remove @ from completion
+                        start_position=-len(prefix),
+                        display=f"📁 {file_path}",
+                        style="class:fuzzy",
+                    )
+
+            # Then yield type options that match
+            type_prefix_lower = type_prefix.lower()
+            for opt_text, opt_display in self.type_options.items():
+                if opt_text.lower().startswith(type_prefix_lower):
+                    yield Completion(
+                        opt_text, start_position=-len(type_prefix), display=opt_display, style="class:type"
+                    )
+            return
+
+        # Parse type and path
+        type_part, rest = prefix[1:].split(" ", 1) if " " in prefix[1:] else (prefix[1:], "")
+        type_ = type_part.strip()
+        if type_ not in self.completer_dict:
+            return
+
+        # Create path document object
+        from prompt_toolkit.document import Document
+
+        path_document = Document(rest, len(rest))
+        # Route to different completers based on type
+        yield from self.completer_dict[type_].get_completions(path_document, complete_event)
+
+
+class SlashCommandCompleter(Completer):
+    """Top-level ``/command`` completer driven by :data:`SLASH_COMMANDS`.
+
+    Triggers only when the current line begins with ``/`` (start-of-line in
+    multi-line input), so ``@Table`` inline references and mid-message slashes
+    are left untouched. Subcommand completion (e.g. ``/mcp list``) is out of
+    scope for this completer — callers can still type the full subcommand.
+    """
+
+    def get_completions(self, document: Document, complete_event=None) -> Iterable[Completion]:
+        from dataengineer.cli.slash_registry import iter_visible
+
+        cursor_line = document.current_line_before_cursor
+        stripped_line = cursor_line.lstrip()
+        if not stripped_line.startswith("/"):
+            return
+
+        # Only complete the head token — once the user has typed a space the
+        # interpretation shifts to command arguments, which prompt-toolkit's
+        # other completers (e.g. ``@Table`` references) may handle.
+        slash_content = stripped_line[1:]
+        if " " in slash_content:
+            return
+
+        typed = slash_content.lower()
+        for spec in iter_visible():
+            tokens = (spec.name, *spec.aliases)
+            matched_token = next((t for t in tokens if t.lower().startswith(typed) or not typed), None)
+            if matched_token is None:
+                continue
+            yield Completion(
+                text=f"{matched_token} ",
+                start_position=-len(slash_content),
+                display=f"/{matched_token}",
+                display_meta=spec.summary,
+            )
+
+
+class ServiceCommandCompleter(Completer):
+    """Completer for ``/<service>.<method>`` CLI routing.
+
+    Produces three tiers of completions (all under the ``/`` slash prefix so
+    this completer composes with ``SlashCommandCompleter`` without the two
+    fighting over the first stroke):
+
+    1. ``/<partial>`` — service names discovered from
+       ``ServiceClientRegistry``, only when ``<partial>`` doesn't match any
+       static slash command. The ``/services`` meta-command itself is owned
+       by the slash registry, not here.
+    2. ``/<service>.<partial>`` — read-only method names that the service's
+       ``available_tools()`` actually advertises (so capability-gated methods
+       like ``get_chart_data`` are omitted when unsupported).
+    3. ``/<service>.<method> --<partial>`` — parameter flags (derived from
+       the tool's ``params_json_schema``) plus ``--help``.
+
+    Non-slash-prefixed input yields nothing so the completer composes cleanly
+    with ``SQLCompleter`` / ``AtReferenceCompleter`` in ``merge_completers``.
+    """
+
+    def __init__(self, cli: Any):
+        # Keep a loose reference so we can reach the lazy
+        # ``service_commands.registry`` — constructing the registry at init
+        # time would pin ``agent_config`` before background init finishes.
+        self.cli = cli
+
+    def _registry(self):
+        commands = getattr(self.cli, "service_commands", None)
+        if commands is None:
+            return None
+        try:
+            return commands.registry
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"ServiceCommandCompleter: registry unavailable: {exc}")
+            return None
+
+    def get_completions(self, document: Document, complete_event=None) -> Iterable[Completion]:
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+
+        registry = self._registry()
+        if registry is None:
+            return
+
+        if " " in text:
+            cmd_part, _, args_part = text.partition(" ")
+            yield from self._complete_args(cmd_part, args_part, registry)
+            return
+
+        yield from self._complete_cmd(text, registry)
+
+    # ------------------------------------------------------------------ #
+    # Tier 1 / 2: service name + method name
+    # ------------------------------------------------------------------ #
+
+    def _complete_cmd(self, cmd_part: str, registry) -> Iterable[Completion]:
+        body = cmd_part[1:]  # drop leading '/'
+        if "." not in body:
+            # Completing ``/service``. ``/services`` itself is provided by
+            # the slash registry via ``SlashCommandCompleter``, so skip it
+            # here to avoid duplicate entries.
+            from dataengineer.cli.service_client import service_type_label
+
+            for name, service_type, status in registry.list_services():
+                slashed = f"/{name}"
+                if slashed.lower().startswith(cmd_part.lower()):
+                    label = service_type_label(service_type)
+                    if status == "missing adapter":
+                        display = f"{slashed}  ({label}, missing adapter)"
+                    else:
+                        display = f"{slashed}  ({label})"
+                    yield Completion(
+                        slashed,
+                        start_position=-len(cmd_part),
+                        display=display,
+                        style="class:keyword",
+                    )
+            return
+
+        service_name, _, method_partial = body.partition(".")
+        client = registry.get(service_name)
+        if client is None:
+            return
+        # Skip method enumeration when the adapter package is not installed.
+        # Without this check, ``ServiceClient._exposed()`` falls back to the
+        # static allow-list (because ``available_tools()`` raises), and we
+        # would offer methods that ``dispatch`` will immediately reject with
+        # "adapter not installed" on Enter — surprising to the user.
+        if not registry.adapter_available(service_name):
+            from dataengineer.cli.service_client import service_type_label
+
+            label = service_type_label(client.service_type)
+            yield Completion(
+                "",
+                start_position=0,
+                display=f"[{label} '{client.service_name}' missing adapter — run `/{client.service_name}` for the install hint]",
+                style="class:keyword",
+            )
+            return
+        prefix = f"/{service_name}."
+        for name, doc in client.list_methods():
+            if not name.lower().startswith(method_partial.lower()) and method_partial:
+                continue
+            display = f"{prefix}{name}  {doc[:50]}" if doc else f"{prefix}{name}"
+            yield Completion(
+                f"{prefix}{name} ",
+                start_position=-len(cmd_part),
+                display=display,
+                style="class:keyword",
+            )
+
+    # ------------------------------------------------------------------ #
+    # Tier 3: --flag completions inside the args
+    # ------------------------------------------------------------------ #
+
+    def _complete_args(self, cmd_part: str, args_part: str, registry) -> Iterable[Completion]:
+        body = cmd_part[1:]
+        if "." not in body:
+            return
+        service_name, _, method_name = body.partition(".")
+        client = registry.get(service_name)
+        if client is None:
+            return
+        # No adapter → suppress flag completion; the command can't run anyway.
+        if not registry.adapter_available(service_name):
+            return
+        tool = client.get_tool(method_name)
+        if tool is None:
+            return
+
+        tokens = args_part.split(" ")
+        last = tokens[-1] if tokens else ""
+        if not last.startswith("--"):
+            return
+        flag_body = last[2:]
+        if "=" in flag_body:
+            # Cursor is past the ``=``; value-level completion is out of scope.
+            return
+
+        props = (tool.params_json_schema or {}).get("properties") or {}
+        suggestions: List[Tuple[str, str]] = [("--help", "show parameter schema")]
+        for pname, pinfo in props.items():
+            if pname == "self":
+                continue
+            desc = ""
+            if isinstance(pinfo, dict):
+                desc = pinfo.get("description", "") or ""
+            suggestions.append((f"--{pname}=", desc))
+
+        for text, desc in suggestions:
+            if not text.startswith(last):
+                continue
+            display = f"{text}  {desc[:50]}" if desc else text
+            yield Completion(
+                text,
+                start_position=-len(last),
+                display=display,
+                style="class:keyword",
+            )
+
+
+class AtReferenceParser:
+    """
+    Independent parser for extracting @Table, @Metrics, and @Sql references from text.
+    This parser only extracts the reference paths, not the actual data.
+    """
+
+    def __init__(self):
+        """Initialize the parser with regex patterns."""
+        # Regular expressions for matching different types of references
+        self.patterns = {
+            "Table": re.compile(rf"@Table\s+({REFERENCE_PATH_REGEX})", re.IGNORECASE),
+            "Metrics": re.compile(rf"@Metrics\s+({REFERENCE_PATH_REGEX})", re.IGNORECASE),
+            "Sqls": re.compile(rf"@Sql\s+({REFERENCE_PATH_REGEX})", re.IGNORECASE),
+        }
+
+    def parse_input(self, text: str) -> Dict[str, List[str]]:
+        """
+        Parse text and extract all @reference paths.
+
+        Args:
+            text: Input text containing @references
+
+        Returns:
+            Dictionary with keys 'tables', 'metrics', 'reference_sql', 'files',
+            each containing a list of extracted paths
+        """
+        results = {"tables": [], "metrics": [], "sqls": []}
+
+        # Extract Table references
+        for match in self.patterns["Table"].finditer(text):
+            path = normalize_reference_path(match.group(1))
+            if path:
+                results["tables"].append(path)
+
+        # Extract Metric references
+        for match in self.patterns["Metrics"].finditer(text):
+            path = normalize_reference_path(match.group(1))
+            if path:
+                results["metrics"].append(path)
+
+        # Extract ReferenceSql references
+        for match in self.patterns["Sqls"].finditer(text):
+            path = normalize_reference_path(match.group(1))
+            if path:
+                results["sqls"].append(path)
+
+        return results
