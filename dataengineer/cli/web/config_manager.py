@@ -1,0 +1,164 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Configuration management for web interface.
+Handles:
+- Datasource discovery
+- CLI argument creation
+- Model configuration
+- Agent config setup
+"""
+
+import os
+from argparse import Namespace
+from functools import lru_cache
+from typing import Any, Dict, List
+
+import structlog
+
+from dataengineer.cli.repl import DataEngineerCLI
+from dataengineer.configuration.agent_config_loader import get_agent_home, parse_config_path
+
+logger = structlog.get_logger("web_chatbot.config")
+
+
+def get_home_from_config(config_path: str) -> str:
+    """Read agent.home from config, defaulting to ``~/.dataengineer``."""
+    try:
+        return get_agent_home(config_path)
+    except Exception as e:
+        logger.warning(f"Failed to read home from config: {e}")
+        return "~/.dataengineer"
+
+
+def get_available_datasources(config_path: str = "") -> List[str]:
+    """Extract available datasource keys from config file."""
+    try:
+        config = _load_config_cached(config_path)
+        agent_config = config.get("agent", config)
+        services = agent_config.get("services", {}) or {}
+        datasources = services.get("datasources", {}) or {}
+        return list(datasources.keys())
+    except Exception as e:
+        logger.error(f"Failed to read datasources from config: {e}")
+        return []
+
+
+def create_cli_args(config_path: str = "", datasource: str = "", catalog: str = "") -> Namespace:
+    """Create CLI arguments for DataEngineerCLI initialization"""
+    args = Namespace()
+    args.config = parse_config_path(config_path)
+    args.history_file = ".datus_history"
+    args.db_type = "sqlite"
+    args.db_path = None
+    args.datasource = datasource
+    args.catalog = catalog
+    args.schema = ""
+    args.debug = False
+    args.no_color = False
+
+    # Read storage path from config file
+    args.storage_path = get_storage_path_from_config(config_path)
+
+    args.save_llm_trace = False
+    # Add non-interactive mode flags
+    args.non_interactive = True
+    args.disable_detail_views = True
+    return args
+
+
+@lru_cache(maxsize=1)
+def _load_config_cached(config_path: str) -> Dict[str, Any]:
+    """Load and cache YAML configuration"""
+    import yaml
+
+    config_path = parse_config_path(config_path)
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def get_storage_path_from_config(config_path: str) -> str:
+    """
+    Get storage path from configuration.
+    """
+    try:
+        from dataengineer.utils.path_manager import DataEngineerPathManager
+
+        return str(DataEngineerPathManager(get_home_from_config(config_path)).data_dir)
+    except Exception as e:
+        logger.warning(f"Failed to read storage path from config: {e}")
+        # Fallback to default
+        return os.path.expanduser("~/.dataengineer/data")
+
+
+class ConfigManager:
+    """Manages agent configuration and model settings."""
+
+    def __init__(self, cli: DataEngineerCLI = None):
+        """
+        Initialize ConfigManager.
+
+        Args:
+            cli: Optional DataEngineerCLI instance. Can be updated later.
+        """
+        self.cli = cli
+
+    def setup_config(self, config_path: str = "conf/agent.yml", datasource: str = "", catalog: str = "") -> DataEngineerCLI:
+        """
+        Setup agent configuration by initializing real DataEngineerCLI.
+
+        Args:
+            config_path: Path to agent configuration file
+            datasource: Datasource to use (optional)
+            catalog: Catalog to use (optional)
+
+        Returns:
+            Initialized DataEngineerCLI instance
+
+        Raises:
+            Exception: If configuration loading fails
+        """
+        # Create CLI arguments
+        args = create_cli_args(config_path, datasource=datasource, catalog=catalog)
+
+        # Initialize real DataEngineerCLI
+        cli = DataEngineerCLI(args)
+
+        # Update internal reference
+        self.cli = cli
+
+        return cli
+
+    def get_available_models(self) -> List[str]:
+        """Get list of available model names"""
+        if not self.cli or not hasattr(self.cli.agent_config, "models"):
+            return []
+
+        try:
+            return list(self.cli.agent_config.models.keys())
+        except Exception as e:
+            logger.error(f"Failed to get available models: {e}")
+            return []
+
+    def get_current_chat_model(self, config_path: str = "conf/agent.yml") -> str:
+        """
+        Get current chat model from configuration.
+
+        Args:
+            config_path: Path to configuration file
+
+        Returns:
+            Model name or "unknown"
+        """
+        try:
+            config = _load_config_cached(config_path)
+            chat_model = config.get("agent", {}).get("nodes", {}).get("chat", {}).get("model", "")
+            if chat_model:
+                return chat_model
+            available_models = self.get_available_models()
+            return available_models[0] if available_models else "unknown"
+        except Exception as e:
+            logger.error(f"Failed to get current chat model: {e}")
+            return "unknown"

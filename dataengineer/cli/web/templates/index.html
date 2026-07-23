@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="https://docs.datus.ai/assets/logo-light.png" />
+    <title>Data Engineering Agent</title>
+
+    <!-- React (externals) -->
+    <script crossorigin src="{{ react_js }}"></script>
+    <script crossorigin src="{{ react_dom_js }}"></script>
+
+    <!-- Data Engineering Agent Chatbot -->
+    <link rel="stylesheet" href="{{ chatbot_css }}" />
+    <script src="{{ chatbot_js }}"></script>
+
+    <style>
+      /* ═══════════════════════════════════════════════════════════════════
+         BW Design System — CSS Variable Tokens
+         Monochrome palette, light + dark themes, zero dependencies.
+         ═══════════════════════════════════════════════════════════════════ */
+
+      /* ── Light Theme ─────────────────────────────────────────────────── */
+      html[data-theme="light"] {
+        --primary-color: #333;
+        --color-link: #555;
+        --color-success: #666;
+        --color-danger: #c0392b;
+        --color-warning: #8a6d3b;
+
+        --app-background: #f5f5f5;
+        --sidebar-background: #eee;
+        --background-title: #f0f0f0;
+        --background-code: #f0f0f0;
+        --background-hover: rgba(0, 0, 0, .05);
+        --background-disabled: #e5e5e5;
+        --popover-background: #fff;
+
+        --text-primary: #1a1a1a;
+        --text-secondary: #666;
+        --text-disabled: #bbb;
+        --text-highlight: #000;
+
+        --border-color: #e0e0e0;
+        --border-input: #d0d0d0;
+        --chat-input-background: #fff;
+        --chat-input-border: #d0d0d0;
+        --progress-line: #d0d0d0;
+
+        --user-msg-background: #e8e8e8;
+        --assistant-msg-background: #fff;
+
+        --color-blue: #555;
+        --color-green: #444;
+        --color-azure: #666;
+        --color-orange: #888;
+        --color-yellow: #999;
+        --color-purple: #777;
+        --color-red: #c0392b;
+
+        --header-bg: #1a1a1a;
+        --header-text: #ccc;
+        --header-dot: #4a4;
+      }
+
+      /* ── Dark Theme ──────────────────────────────────────────────────── */
+      html[data-theme="dark"] {
+        --primary-color: #aaa;
+        --color-link: #999;
+        --color-success: #888;
+        --color-danger: #e74c3c;
+        --color-warning: #c9a84c;
+
+        --app-background: #111;
+        --sidebar-background: #181818;
+        --background-title: #1a1a1a;
+        --background-code: #1a1a1a;
+        --background-hover: rgba(255, 255, 255, .04);
+        --background-disabled: #141414;
+        --popover-background: #222;
+
+        --text-primary: #ccc;
+        --text-secondary: #888;
+        --text-disabled: #555;
+        --text-highlight: #eee;
+
+        --border-color: #2a2a2a;
+        --border-input: #333;
+        --chat-input-background: #1a1a1a;
+        --chat-input-border: #333;
+        --progress-line: #333;
+
+        --user-msg-background: #2a2a2a;
+        --assistant-msg-background: #1e1e1e;
+
+        --color-blue: #999;
+        --color-green: #888;
+        --color-azure: #aaa;
+        --color-orange: #999;
+        --color-yellow: #aaa;
+        --color-purple: #999;
+        --color-red: #e74c3c;
+
+        --header-bg: #0a0a0a;
+        --header-text: #999;
+        --header-dot: #4a4;
+      }
+
+      /* ── Reset & Base ────────────────────────────────────────────────── */
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+
+      html, body {
+        height: 100%;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+                     'Helvetica Neue', Arial, sans-serif;
+        background: var(--app-background);
+        color: var(--text-primary);
+        transition: background 0.3s, color 0.3s;
+      }
+
+      /* ── App Layout ──────────────────────────────────────────────────── */
+      #app-wrapper {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      /* ── Brand Header Bar ────────────────────────────────────────────── */
+      .brand-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        height: 40px;
+        min-height: 40px;
+        padding: 0 16px;
+        background: var(--header-bg);
+        color: var(--header-text);
+        font-size: 13px;
+        user-select: none;
+        z-index: 100;
+      }
+
+      .brand-logo {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        border-radius: 4px;
+        background: #444;
+        color: #ccc;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+      }
+
+      .brand-title {
+        font-weight: 600;
+        font-size: 13px;
+        letter-spacing: 0.3px;
+      }
+
+      .brand-tagline {
+        color: #777;
+        font-size: 11px;
+        margin-left: 4px;
+      }
+
+      .brand-spacer { flex: 1; }
+
+      .brand-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--header-dot);
+        box-shadow: 0 0 4px var(--header-dot);
+        flex-shrink: 0;
+      }
+
+      .brand-version {
+        font-size: 10px;
+        color: #666;
+        margin-right: 8px;
+      }
+
+      .theme-toggle {
+        background: none;
+        border: 1px solid #555;
+        color: var(--header-text);
+        padding: 2px 8px;
+        border-radius: 3px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 0.2s;
+      }
+
+      .theme-toggle:hover {
+        background: rgba(255,255,255,0.08);
+      }
+
+      /* ── Main Content ────────────────────────────────────────────────── */
+      #main-content {
+        flex: 1;
+        overflow: hidden;
+        position: relative;
+      }
+
+      #chatbot-root {
+        width: 100%;
+        height: 100%;
+      }
+
+      /* ── Scrollbar ───────────────────────────────────────────────────── */
+      ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      ::-webkit-scrollbar-thumb {
+        background: #c1c1c1;
+        border-radius: 3px;
+      }
+
+      ::-webkit-scrollbar-thumb:hover {
+        background: #a1a1a1;
+      }
+
+      /* ── Code Text Selection ─────────────────────────────────────────── */
+      pre, code {
+        -webkit-user-select: text !important;
+        user-select: text !important;
+      }
+
+      /* ── Chatbot Style Overrides ─────────────────────────────────────── */
+      /* Override CDN chatbot styles with BW monochrome palette */
+      .chat-container {
+        background: var(--app-background) !important;
+      }
+
+      /* Message bubbles */
+      [class*="message"][class*="user"],
+      [class*="Message"][class*="user"] {
+        background: var(--user-msg-background) !important;
+        color: var(--text-primary) !important;
+      }
+
+      [class*="message"][class*="assistant"],
+      [class*="Message"][class*="assistant"],
+      [class*="message"][class*="bot"],
+      [class*="Message"][class*="bot"] {
+        background: var(--assistant-msg-background) !important;
+        color: var(--text-primary) !important;
+      }
+
+      /* Chat input area */
+      [class*="chat-input"],
+      [class*="ChatInput"],
+      textarea[class*="input"] {
+        background: var(--chat-input-background) !important;
+        border-color: var(--chat-input-border) !important;
+        color: var(--text-primary) !important;
+      }
+
+      /* Sidebar / panels */
+      [class*="sidebar"],
+      [class*="Sidebar"],
+      [class*="panel"][class*="side"] {
+        background: var(--sidebar-background) !important;
+        border-color: var(--border-color) !important;
+      }
+
+      /* Buttons */
+      [class*="button"],
+      [class*="Button"],
+      button[class*="btn"] {
+        background: var(--background-title) !important;
+        border-color: var(--border-color) !important;
+        color: var(--text-primary) !important;
+      }
+
+      /* Links */
+      a, [class*="link"] {
+        color: var(--color-link) !important;
+      }
+
+      /* Code blocks in messages */
+      [class*="message"] pre,
+      [class*="message"] code,
+      [class*="Message"] pre,
+      [class*="Message"] code {
+        background: var(--background-code) !important;
+        border-color: var(--border-color) !important;
+      }
+
+      /* General text */
+      [class*="chat"], [class*="Chat"] {
+        color: var(--text-primary) !important;
+      }
+
+      .text-secondary, [class*="text-secondary"], [class*="subtitle"] {
+        color: var(--text-secondary) !important;
+      }
+
+      /* Borders */
+      [class*="divider"], [class*="Divider"], [class*="separator"] {
+        border-color: var(--border-color) !important;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="app-wrapper">
+      <!-- Brand Header Bar -->
+      <header class="brand-header">
+        <div class="brand-logo">DE</div>
+        <span class="brand-title">Data Engineering Agent</span>
+        <span class="brand-tagline">Welcome</span>
+        <div class="brand-spacer"></div>
+        <span class="brand-version">v0.2.6</span>
+        <div class="brand-dot" title="Connected"></div>
+        <button class="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark theme">
+          <span id="theme-icon">&#9788;</span>
+        </button>
+      </header>
+
+      <!-- Main Chatbot Content -->
+      <div id="main-content">
+        <div id="chatbot-root"></div>
+      </div>
+    </div>
+
+    <script>
+      /* ── Theme Toggle ────────────────────────────────────────────────── */
+      function toggleTheme() {
+        var html = document.documentElement;
+        var icon = document.getElementById('theme-icon');
+        var current = html.getAttribute('data-theme');
+        var next = current === 'dark' ? 'light' : 'dark';
+        html.setAttribute('data-theme', next);
+        icon.innerHTML = next === 'dark' ? '&#9790;' : '&#9788;';
+        try { localStorage.setItem('data-engineer-theme', next); } catch(e) {}
+      }
+
+      (function() {
+        var saved = null;
+        try { saved = localStorage.getItem('data-engineer-theme'); } catch(e) {}
+        if (saved === 'dark') {
+          document.documentElement.setAttribute('data-theme', 'dark');
+          document.getElementById('theme-icon').innerHTML = '&#9790;';
+        }
+      })();
+
+      /* ── Initialize Chatbot ──────────────────────────────────────────── */
+      DatusChatbot.initChatbot({
+        el: '#chatbot-root',
+        requestOrigin: {{ request_origin_json }} || window.location.origin,
+        userName: {{ user_name_json }} || 'User',
+        greeting: 'Welcome',
+      });
+
+      /* ── Replace CDN greeting text with "Welcome" ────────────────────── */
+      (function replaceGreeting() {
+        var attempts = 0;
+        var maxAttempts = 20;
+        var timer = setInterval(function() {
+          attempts++;
+          var root = document.getElementById('chatbot-root');
+          if (!root) { if (attempts >= maxAttempts) clearInterval(timer); return; }
+
+          // Try innerText-based search first (handles nested elements)
+          var all = root.querySelectorAll('*');
+          for (var i = 0; i < all.length; i++) {
+            var el = all[i];
+            if (el.children.length === 0 && el.innerText &&
+                el.innerText.indexOf('Hey') !== -1 &&
+                el.innerText.indexOf('help') !== -1) {
+              el.innerText = 'Welcome';
+              clearInterval(timer);
+              return;
+            }
+          }
+
+          // Fallback: walk all text nodes
+          var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+          var node;
+          while ((node = walker.nextNode())) {
+            if (node.textContent.indexOf('Hey') !== -1 &&
+                node.textContent.indexOf('help') !== -1) {
+              node.textContent = 'Welcome';
+              clearInterval(timer);
+              return;
+            }
+          }
+
+          if (attempts >= maxAttempts) clearInterval(timer);
+        }, 500);
+      })();
+    </script>
+  </body>
+</html>
