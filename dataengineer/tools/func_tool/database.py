@@ -1,0 +1,1689 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+# -*- coding: utf-8 -*-
+import json
+import os
+import re
+from collections import OrderedDict
+from dataclasses import dataclass
+from fnmatch import fnmatchcase
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Union
+
+from agents import Tool
+from datus_db_core import BaseSqlConnector, connector_registry
+
+from dataengineer.configuration.agent_config import AgentConfig
+from dataengineer.schemas.agent_models import SubAgentConfig
+from dataengineer.storage.schema_metadata.store import SchemaWithValueRAG
+from dataengineer.storage.semantic_model.store import SemanticModelRAG
+from dataengineer.tools.db_tools.db_manager import DBManager, db_manager_instance
+from dataengineer.tools.func_tool.base import FuncToolResult, trans_to_function_tool
+from dataengineer.utils.compress_utils import DataCompressor
+from dataengineer.utils.constants import DBType, SQLType
+from dataengineer.utils.exceptions import DataEngineerException, ErrorCode
+from dataengineer.utils.loggings import get_logger
+from dataengineer.utils.mcp_decorators import mcp_tool, mcp_tool_class
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class TableCoordinate:
+    catalog: str = ""
+    database: str = ""
+    schema: str = ""
+    table: str = ""
+
+
+@dataclass(frozen=True)
+class ScopedTablePattern:
+    raw: str
+    catalog: str = ""
+    database: str = ""
+    schema: str = ""
+    table: str = ""
+
+    def matches(self, coordinate: TableCoordinate) -> bool:
+        return all(
+            _pattern_matches(getattr(self, field), getattr(coordinate, field))
+            for field in ("catalog", "database", "schema", "table")
+        )
+
+
+def _pattern_matches(pattern: str, value: str) -> bool:
+    if not pattern or pattern in ("*", "%"):
+        return True
+    if not value:
+        # Empty value means the field could not be resolved from either the SQL
+        # or connector defaults (e.g. catalog_name not set).  Treat as a wildcard
+        # so that scope checking only enforces fields we can actually verify.
+        return True
+    normalized_pattern = pattern.replace("%", "*")
+    return fnmatchcase(value, normalized_pattern)
+
+
+@mcp_tool_class(
+    name="db_tool",
+    availability_property="has_db_tools",
+)
+class DBFuncTool:
+    """
+    Database function tool that supports dynamic connector switching.
+
+    This class can work in two modes:
+    1. Single connector mode (legacy): Pass a single BaseSqlConnector
+    2. Multi-connector mode: Pass a DBManager with datasource for dynamic connector lookup
+
+    In multi-connector mode, connectors are cached with LRU eviction to avoid
+    repeated lookups while limiting memory usage.
+    """
+
+    DEFAULT_CONNECTOR_CACHE_SIZE = 8
+
+    @classmethod
+    def create_dynamic(cls, agent_config: AgentConfig, sub_agent_name: Optional[str] = None) -> "DBFuncTool":
+        """Create DBFuncTool instance (required by mcp_tool_class contract)."""
+        return cls(agent_config=agent_config, sub_agent_name=sub_agent_name)
+
+    @classmethod
+    def create_static(
+        cls,
+        agent_config: AgentConfig,
+        sub_agent_name: Optional[str] = None,
+        database_name: Optional[str] = None,
+    ) -> "DBFuncTool":
+        """Create DBFuncTool instance with optional datasource override (required by mcp_tool_class contract)."""
+        return cls(agent_config=agent_config, default_datasource=database_name or None, sub_agent_name=sub_agent_name)
+
+    def __init__(
+        self,
+        connector_or_manager: Union[BaseSqlConnector, DBManager, None] = None,
+        agent_config: Optional[AgentConfig] = None,
+        *,
+        default_datasource: Optional[str] = None,
+        sub_agent_name: Optional[str] = None,
+        scoped_tables: Optional[Iterable[str]] = None,
+        connector_cache_size: int = DEFAULT_CONNECTOR_CACHE_SIZE,
+    ):
+        """
+        Initialize DBFuncTool.
+
+        Args:
+            connector_or_manager: A single BaseSqlConnector (legacy mode), a DBManager (multi-connector mode),
+                                  or None to auto-create a DBManager from agent_config.
+            agent_config: Agent configuration (required when connector_or_manager is None or DBManager)
+            default_datasource: Default datasource for multi-datasource scenarios
+            sub_agent_name: Optional sub-agent name for scoped context
+            scoped_tables: Optional explicit table scope patterns
+            connector_cache_size: Max connectors to cache (LRU eviction), default 8
+        """
+        if connector_or_manager is None:
+            if not agent_config:
+                raise ValueError("agent_config is required when connector_or_manager is not provided")
+            connector_or_manager = db_manager_instance(agent_config.datasource_configs)
+
+        # Determine mode based on input type
+        if isinstance(connector_or_manager, DBManager):
+            if not agent_config:
+                raise ValueError("agent_config is required when using DBManager mode")
+            self._db_manager = connector_or_manager
+            self._default_datasource = default_datasource or (agent_config.current_datasource if agent_config else "")
+            self._datasources = list(agent_config.current_db_configs().keys()) if agent_config else []
+            self._connector_cache: OrderedDict[str, BaseSqlConnector] = OrderedDict()
+            self._connector_cache_size = connector_cache_size
+            self._primary_connector = self._db_manager.first_conn(self._default_datasource)
+            self._is_multi_connector = True
+        else:
+            self._init_single_db_connector(connector_or_manager)
+
+        model_name = agent_config.active_model().model if agent_config else "gpt-3.5-turbo"
+        self.compressor = DataCompressor(model_name=model_name)
+        self.agent_config = agent_config
+        self.sub_agent_name = sub_agent_name
+        self.schema_rag = SchemaWithValueRAG(agent_config, sub_agent_name) if agent_config else None
+        self._field_order = self._determine_field_order()
+        self._scoped_patterns = self._load_scoped_patterns(scoped_tables)
+
+        self._semantic_storage = SemanticModelRAG(agent_config, sub_agent_name) if agent_config else None
+        self.has_schema = self.schema_rag and self.schema_rag.schema_store.table_size() > 0
+
+        self.has_semantic_models = self._semantic_storage and self._semantic_storage.get_size() > 0
+
+    def _init_single_db_connector(self, connector: BaseSqlConnector):
+        # Legacy single connector mode
+        self._db_manager = None
+        self._default_datasource = ""
+        self._connector_cache = OrderedDict()
+        self._connector_cache_size = 0
+        self._primary_connector = connector
+        self._is_multi_connector = False
+
+    @property
+    def connector(self) -> BaseSqlConnector:
+        """Get the primary/default connector (for backward compatibility)."""
+        return self._primary_connector
+
+    def _get_connector(self, datasource: Optional[str] = None) -> BaseSqlConnector:
+        """
+        Get connector for the specified datasource.
+
+        In single connector mode, always returns the primary connector.
+        In multi-connector mode, returns cached connector or fetches from db_manager.
+
+        Args:
+            datasource: Datasource name. If None/empty, uses default datasource.
+
+        Returns:
+            BaseSqlConnector for the specified datasource
+        """
+        if self._db_manager is None:
+            # Single connector mode
+            return self._primary_connector
+
+        # Multi-connector mode
+        db_name = datasource or self._default_datasource
+
+        # Check cache
+        if db_name in self._connector_cache:
+            # Move to end (most recently used)
+            self._connector_cache.move_to_end(db_name)
+            return self._connector_cache[db_name]
+
+        # Fetch from db_manager.
+        # Each datasource in services.datasources is its own group (see AgentConfig.datasource_configs).
+        # For cross-database scenarios, use db_name as both datasource and logic_name.
+        try:
+            connector = self._db_manager.get_conn(db_name, db_name)
+        except (KeyError, ValueError) as e:
+            raise DataEngineerException(
+                ErrorCode.COMMON_VALIDATION_FAILED,
+                message=f"Datasource '{db_name}' is not configured. "
+                f"Available datasources: {', '.join(self._datasources)}.",
+            ) from e
+
+        # Ensure connector is connected
+        if hasattr(connector, "connect"):
+            connector.connect()
+
+        # Add to cache with LRU eviction
+        if self._connector_cache_size > 0 and len(self._connector_cache) >= self._connector_cache_size:
+            # Evict least recently used (first item)
+            evicted_name, _ = self._connector_cache.popitem(last=False)
+            logger.debug(f"LRU evicting connector: {evicted_name}")
+
+        self._connector_cache[db_name] = connector
+        return connector
+
+    def _reset_database_for_rag(self, datasource: Optional[str] = "") -> str:
+        connector = self._get_connector(datasource)
+        return connector.database_name
+
+    def _determine_field_order(self) -> Sequence[str]:
+        dialect = getattr(self._primary_connector, "dialect", "") or ""
+        fields: List[str] = []
+        if connector_registry.support_catalog(dialect):
+            fields.append("catalog")
+        if connector_registry.support_database(dialect) or dialect == DBType.SQLITE:
+            fields.append("database")
+        if connector_registry.support_schema(dialect):
+            fields.append("schema")
+        fields.append("table")
+        return fields
+
+    def _load_scoped_patterns(self, explicit_tokens: Optional[Iterable[str]]) -> List[ScopedTablePattern]:
+        tokens: List[str] = []
+        if explicit_tokens:
+            tokens.extend(explicit_tokens)
+        else:
+            tokens.extend(self._resolve_scoped_context_tables())
+
+        patterns: List[ScopedTablePattern] = []
+        for token in tokens:
+            scoped_pattern = self._parse_scope_token(token)
+            if scoped_pattern:
+                patterns.append(scoped_pattern)
+        return patterns
+
+    def _resolve_scoped_context_tables(self) -> Sequence[str]:
+        if not self.agent_config:
+            return []
+        scoped_entries: List[str] = []
+
+        if self.sub_agent_name:
+            sub_agent_config = self._load_sub_agent_config(self.sub_agent_name)
+            if sub_agent_config and sub_agent_config.scoped_context and sub_agent_config.scoped_context.tables:
+                scoped_entries.extend(sub_agent_config.scoped_context.as_lists().tables)
+
+        return scoped_entries
+
+    def _load_sub_agent_config(self, sub_agent_name: str) -> Optional[SubAgentConfig]:
+        if not self.agent_config:
+            return None
+        try:
+            config = self.agent_config.sub_agent_config(sub_agent_name)
+        except Exception:
+            return None
+
+        if not config:
+            return None
+        if isinstance(config, SubAgentConfig):
+            return config
+
+        try:
+            return SubAgentConfig.model_validate(config)
+        except Exception:
+            return None
+
+    def _parse_scope_token(self, token: str) -> Optional[ScopedTablePattern]:
+        token = (token or "").strip()
+        if not token:
+            return None
+        parts = [self._normalize_identifier_part(part) for part in token.split(".") if part.strip()]
+        if not parts:
+            return None
+        # Align parts from right to left (table is always rightmost)
+        # e.g., for "public.wb_health_population" with field_order ["database", "schema", "table"]:
+        #   - parts = ["public", "wb_health_population"]
+        #   - align from right: schema="public", table="wb_health_population"
+        # When parts > fields, keep only the rightmost num_fields parts
+        values: Dict[str, str] = {field: "" for field in self._field_order}
+        num_fields = len(self._field_order)
+        trimmed_parts = parts[-num_fields:]
+        start_field_idx = max(0, num_fields - len(trimmed_parts))
+        for i, part in enumerate(trimmed_parts):
+            field_idx = start_field_idx + i
+            if field_idx < num_fields:
+                values[self._field_order[field_idx]] = part
+        return ScopedTablePattern(raw=token, **values)
+
+    def _get_semantic_model(
+        self, catalog: str = "", database: str = "", schema: str = "", table_name: str = ""
+    ) -> Dict[str, Any]:
+        if not self.has_semantic_models:
+            return {}
+        result = self._semantic_storage.get_semantic_model(
+            catalog_name=catalog,
+            database_name=database,
+            schema_name=schema,
+            table_name=table_name,
+            select_fields=[
+                "semantic_model_name",
+                "dimensions",
+                "measures",
+                "description",
+                "identifiers",
+            ],
+        )
+        logger.info(f"get_semantic_model result: {result}")
+        return result if result is not None else {}
+
+    def _enrich_fields_with_descriptions(
+        self, field_list_json: str, ddl_columns: List[Dict[str, Any]], field_type: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Enrich field list with descriptions from YAML (priority) and DDL (fallback).
+
+        Args:
+            field_list_json: JSON string of field definitions from semantic model
+            ddl_columns: Column metadata from DDL
+            field_type: Type of fields ("dimensions", "measures", "identifiers")
+
+        Returns:
+            List of enriched field dictionaries with name and description
+        """
+        import json
+
+        try:
+            # Parse field list from JSON string
+            if not field_list_json:
+                return []
+
+            field_list = json.loads(field_list_json) if isinstance(field_list_json, str) else field_list_json
+
+            # Handle simple list of field names
+            if isinstance(field_list, list) and all(isinstance(f, str) for f in field_list):
+                field_list = [{"name": f} for f in field_list]
+            elif not isinstance(field_list, list):
+                return []
+
+            # Build DDL column lookup by name
+            ddl_lookup = {col.get("name", "").lower(): col for col in ddl_columns if "name" in col}
+
+            # Enrich each field
+            enriched_fields = []
+            for field in field_list:
+                if isinstance(field, str):
+                    field = {"name": field}
+                elif not isinstance(field, dict):
+                    continue
+
+                field_name = field.get("name", "")
+                if not field_name:
+                    continue
+
+                enriched_field = {"name": field_name}
+
+                # Priority 1: Use description from YAML if exists
+                if "description" in field and field["description"]:
+                    enriched_field["description"] = field["description"]
+                else:
+                    # Priority 2: Fallback to DDL column comment
+                    ddl_col = ddl_lookup.get(field_name.lower())
+                    if ddl_col and ddl_col.get("comment"):
+                        enriched_field["description"] = ddl_col["comment"]
+
+                # Preserve other field attributes (type, expr, entity, etc.)
+                for key, value in field.items():
+                    if key not in ("name", "description"):
+                        enriched_field[key] = value
+
+                enriched_fields.append(enriched_field)
+
+            return enriched_fields
+
+        except Exception as e:
+            logger.warning(f"Failed to enrich {field_type} with descriptions: {e}")
+            return []
+
+    def _resolve_workspace_root(self) -> str:
+        """Resolve workspace_root from ``agent_config.project_root``; fall back to cwd."""
+        if self.agent_config and hasattr(self.agent_config, "project_root"):
+            workspace_root = self.agent_config.project_root
+        else:
+            workspace_root = "."
+        return os.path.expanduser(workspace_root)
+
+    def _read_sql_from_file(self, file_path: str) -> str:
+        """Read SQL content from a file path relative to workspace root."""
+        if os.path.isabs(file_path):
+            raise DataEngineerException(
+                ErrorCode.TOOL_INVALID_INPUT,
+                message_args={"error_message": f"Absolute paths are not allowed: {file_path}"},
+            )
+        if ".." in file_path:
+            raise DataEngineerException(
+                ErrorCode.TOOL_INVALID_INPUT, message_args={"error_message": f"Invalid SQL file path: {file_path}"}
+            )
+        workspace_root = self._resolve_workspace_root()
+        full_path = (Path(workspace_root) / file_path).resolve()
+        workspace_resolved = Path(workspace_root).resolve()
+        if not str(full_path).startswith(str(workspace_resolved) + os.sep) and full_path != workspace_resolved:
+            raise DataEngineerException(
+                ErrorCode.TOOL_INVALID_INPUT,
+                message_args={"error_message": f"SQL file path escapes workspace: {file_path}"},
+            )
+        if not full_path.exists():
+            raise DataEngineerException(
+                ErrorCode.COMMON_FILE_NOT_FOUND,
+                message_args={"config_name": "SQL", "file_name": file_path},
+            )
+        return full_path.read_text(encoding="utf-8")
+
+    @staticmethod
+    def _normalize_identifier_part(value: Optional[str]) -> str:
+        if value is None:
+            return ""
+        normalized = str(value).strip()
+        if not normalized:
+            return ""
+        # Strip common quoting characters
+        return normalized.strip("`\"'[]")
+
+    def _default_field_value(self, field: str, explicit: Optional[str]) -> str:
+        if field not in self._field_order:
+            return ""
+        if explicit:
+            return self._normalize_identifier_part(explicit)
+
+        fallback_attr_map = {
+            "catalog": "catalog_name",
+            "database": "database_name",
+            "schema": "schema_name",
+        }
+        fallback_attr = fallback_attr_map.get(field)
+        if fallback_attr and hasattr(self.connector, fallback_attr):
+            return self._normalize_identifier_part(getattr(self.connector, fallback_attr))
+        return ""
+
+    def _build_table_coordinate(
+        self,
+        raw_name: str,
+        catalog: Optional[str] = "",
+        database: Optional[str] = "",
+        schema: Optional[str] = "",
+    ) -> TableCoordinate:
+        coordinate = TableCoordinate(
+            catalog=self._default_field_value("catalog", catalog),
+            database=self._default_field_value("database", database),
+            schema=self._default_field_value("schema", schema),
+            table=self._normalize_identifier_part(raw_name),
+        )
+        parts = [self._normalize_identifier_part(part) for part in raw_name.split(".") if part.strip()]
+        if parts:
+            coordinate.table = parts[-1]
+            idx = len(parts) - 2
+            for field in reversed(self._field_order[:-1]):
+                if idx < 0:
+                    break
+                setattr(coordinate, field, parts[idx])
+                idx -= 1
+        return coordinate
+
+    def _table_matches_scope(self, coordinate: TableCoordinate) -> bool:
+        if not self._scoped_patterns:
+            return True
+        return any(pattern.matches(coordinate) for pattern in self._scoped_patterns)
+
+    def _filter_table_entries(
+        self,
+        entries: Sequence[Dict[str, Any]],
+        catalog: Optional[str],
+        database: Optional[str],
+        schema: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        if not self._scoped_patterns:
+            return list(entries)
+
+        filtered: List[Dict[str, Any]] = []
+        for entry in entries:
+            coordinate = self._build_table_coordinate(
+                raw_name=str(entry.get("name", "")),
+                catalog=catalog,
+                database=database,
+                schema=schema,
+            )
+            if self._table_matches_scope(coordinate):
+                filtered.append(entry)
+        return filtered
+
+    def _matches_catalog_database(self, pattern: ScopedTablePattern, catalog: str, database: str) -> bool:
+        if pattern.catalog and not _pattern_matches(pattern.catalog, catalog):
+            return False
+        if pattern.database and not _pattern_matches(pattern.database, database):
+            return False
+        return True
+
+    def _database_matches_scope(self, catalog: Optional[str], database: str) -> bool:
+        if not self._scoped_patterns:
+            return True
+        catalog_value = self._default_field_value("catalog", catalog or "")
+        database_value = self._default_field_value("database", database or "")
+
+        wildcard_allowed = False
+        for pattern in self._scoped_patterns:
+            if not self._matches_catalog_database(pattern, catalog_value, database_value):
+                continue
+            if pattern.database:
+                if _pattern_matches(pattern.database, database_value):
+                    return True
+                continue
+            wildcard_allowed = True
+        return wildcard_allowed
+
+    def _schema_matches_scope(self, catalog: Optional[str], database: Optional[str], schema: str) -> bool:
+        if not self._scoped_patterns:
+            return True
+        catalog_value = self._default_field_value("catalog", catalog or "")
+        database_value = self._default_field_value("database", database or "")
+        schema_value = self._default_field_value("schema", schema or "")
+
+        wildcard_allowed = False
+        for pattern in self._scoped_patterns:
+            if not self._matches_catalog_database(pattern, catalog_value, database_value):
+                continue
+            if pattern.schema:
+                if _pattern_matches(pattern.schema, schema_value):
+                    return True
+                continue
+            wildcard_allowed = True
+        return wildcard_allowed
+
+    def _check_sql_table_scope(self, sql: str) -> List[str]:
+        """Return table names from *sql* that fall outside the scoped context."""
+        if not self._scoped_patterns:
+            return []
+        from dataengineer.utils.sql_utils import extract_table_names
+
+        dialect = getattr(self._primary_connector, "dialect", "") or ""
+        table_names = extract_table_names(sql, dialect=dialect, ignore_empty=True)
+        if not table_names:
+            return []  # can't parse → allow (SHOW/DESCRIBE/EXPLAIN have no tables)
+        out_of_scope: List[str] = []
+        for name in table_names:
+            coordinate = self._build_table_coordinate(raw_name=name)
+            if not self._table_matches_scope(coordinate):
+                out_of_scope.append(name)
+        return out_of_scope
+
+    @staticmethod
+    def all_tools_name() -> List[str]:
+        from dataengineer.utils.class_utils import get_public_instance_methods
+
+        result = []
+        for name in get_public_instance_methods(DBFuncTool).keys():
+            if name == "available_tools":
+                continue
+            result.append(name)
+        return result
+
+    def available_tools(self) -> List[Tool]:
+        bound_tools = []
+        methods_to_convert: List[Callable] = [self.list_tables, self.describe_table]
+
+        if self.has_schema:
+            methods_to_convert.append(self.search_table)
+
+        methods_to_convert.extend(
+            [
+                self.read_query,
+                self.get_table_ddl,
+            ]
+        )
+
+        if connector_registry.support_database(self.connector.dialect):
+            bound_tools.append(trans_to_function_tool(self.list_databases))
+
+        if connector_registry.support_schema(self.connector.dialect):
+            bound_tools.append(trans_to_function_tool(self.list_schemas))
+
+        for bound_method in methods_to_convert:
+            bound_tools.append(trans_to_function_tool(bound_method))
+        return bound_tools
+
+    @mcp_tool(availability_check="has_schema")
+    def search_table(
+        self,
+        query_text: str,
+        catalog: str = "",
+        database: str = "",
+        schema_name: str = "",
+        datasource: Optional[str] = "",
+        top_n: int = 5,
+        simple_sample_data: bool = True,
+    ) -> FuncToolResult:
+        """
+        Retrieve table candidates by semantic similarity over stored schema metadata and optional sample rows.
+        Use this tool when the agent needs tables matching a natural-language description.
+        This tool helps find relevant tables by searching through table names, schemas (DDL),
+        and sample data using semantic search.
+
+        Use this tool when you need to:
+        - Find tables related to a specific business concept or domain
+        - Discover tables containing certain types of data
+        - Locate tables for SQL query development
+        - Understand what tables are available in a datasource
+
+        **Application Guidance**:
+        1. If table matches (via definition/description/dimensions/measures/sample_data), use it directly
+        2. If partitioned (e.g., date-based in definition), explore correct partition via describe_table
+        3. If no match, use list_tables for broader exploration
+
+        Args:
+            query_text: Description of the table you want (e.g. "daily active users per country").
+            catalog: Catalog filter. Only use for databases that support catalogs (StarRocks, Databricks).
+                Leave empty for PostgreSQL, MySQL, Snowflake, SQLite, DuckDB.
+            database: Database filter. Use for PostgreSQL, MySQL, Snowflake, StarRocks, DuckDB.
+                Leave empty for SQLite (uses file path instead).
+            schema_name: Schema filter. Use for PostgreSQL, Snowflake, DuckDB (e.g., "public").
+                Leave empty for MySQL (database = schema), StarRocks, SQLite.
+            datasource: Optional datasource to route the search to. Defaults to the current datasource.
+            top_n: Maximum number of rows to return after scoping filters.
+            simple_sample_data: If True, sample rows omit catalog/database/schema fields for brevity.
+
+        Returns:
+            FuncToolResult where:
+                - success=1 with result={"metadata": [...], "sample_data": [...]} (empty lists when no matches).
+                - success=0 with error text if schema storage is unavailable or lookup fails.
+        """
+        if not self.has_schema:
+            return FuncToolResult(success=0, error="Table search is unavailable because schema storage is not ready.")
+
+        try:
+            metadata, sample_values = self.schema_rag.search_similar(
+                query_text,
+                catalog_name=catalog,
+                database_name=self._reset_database_for_rag(datasource),
+                schema_name=schema_name,
+                table_type="full",
+                top_n=top_n,
+            )
+            result_dict: Dict[str, List[Dict[str, Any]]] = {"metadata": [], "sample_data": []}
+
+            metadata_rows: List[Dict[str, Any]] = []
+            if metadata:
+                metadata_rows = metadata.select(
+                    [
+                        "catalog_name",
+                        "database_name",
+                        "schema_name",
+                        "table_name",
+                        "table_type",
+                        "identifier",
+                        "_distance",
+                    ]
+                ).to_pylist()
+            if not metadata_rows:
+                return FuncToolResult(success=1, result=result_dict)
+
+            current_has_semantic = False
+            if self.has_semantic_models:
+                for metadata_row in metadata_rows:
+                    semantic_model = self._get_semantic_model(
+                        metadata_row["catalog_name"],
+                        metadata_row["database_name"],
+                        metadata_row["schema_name"],
+                        metadata_row["table_name"],
+                    )
+                    if semantic_model:
+                        current_has_semantic = True
+                        metadata_row["semantic_model_name"] = semantic_model["semantic_model_name"]
+                        metadata_row["description"] = semantic_model["description"]
+                        metadata_row["dimensions"] = semantic_model["dimensions"]
+                        metadata_row["measures"] = semantic_model["measures"]
+                        metadata_row["identifiers"] = semantic_model["identifiers"]
+                        # Only enrich the top match to prioritize the most relevant table
+                        break
+
+            result_dict["metadata"] = metadata_rows
+            if current_has_semantic:
+                result_dict["sample_data"] = self.compressor.compress([])
+                return FuncToolResult(success=1, result=result_dict)
+
+            sample_rows: List[Dict[str, Any]] = []
+            if sample_values:
+                if simple_sample_data:
+                    selected_fields = ["identifier", "table_type", "sample_rows", "_distance"]
+                else:
+                    selected_fields = [
+                        "identifier",
+                        "catalog_name",
+                        "database_name",
+                        "schema_name",
+                        "table_type",
+                        "table_name",
+                        "sample_rows",
+                        "_distance",
+                    ]
+                sample_rows = sample_values.select(selected_fields).to_pylist()
+            result_dict["sample_data"] = self.compressor.compress(sample_rows)
+            return FuncToolResult(result=result_dict)
+        except Exception as e:
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool()
+    def list_databases(
+        self, catalog: Optional[str] = "", datasource: Optional[str] = "", include_sys: Optional[bool] = False
+    ) -> FuncToolResult:
+        """
+        Enumerate databases accessible through the current connection.
+        Use this when you need to discover what databases are available before querying.
+        For finding specific tables by description, use search_table instead.
+
+        Args:
+            catalog: Optional catalog to scope the lookup (dialect dependent).
+            datasource: Optional datasource to route the query to. Defaults to the current datasource.
+            include_sys: Set True to include system databases; defaults to False.
+
+        Returns:
+            FuncToolResult with result as a list of database names ordered by the connector. On failure success=0 with
+            an explanatory error message.
+        """
+        if self._is_multi_connector:
+            if datasource and datasource not in self._datasources:
+                return FuncToolResult(
+                    success=0, error=f"Datasource '{datasource}' not found. Available: {list(self._datasources)}"
+                )
+            source = datasource or self._default_datasource
+            try:
+                connector = self._get_connector(source)
+                databases = connector.get_databases(catalog, include_sys=include_sys)
+                filtered = [db for db in databases if self._database_matches_scope(catalog, db)]
+                return FuncToolResult(result=filtered)
+            except Exception as e:
+                return FuncToolResult(success=0, error=str(e))
+        try:
+            connector = self._get_connector(datasource)
+            databases = connector.get_databases(catalog, include_sys=include_sys)
+            filtered = [db for db in databases if self._database_matches_scope(catalog, db)]
+            return FuncToolResult(result=filtered)
+        except Exception as e:
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool()
+    def list_schemas(
+        self,
+        catalog: Optional[str] = "",
+        database: Optional[str] = "",
+        datasource: Optional[str] = "",
+        include_sys: bool = False,
+    ) -> FuncToolResult:
+        """
+        List schema names under the supplied catalog/database coordinate.
+        Use this to explore schema structure when working with databases that have multiple schemas
+        (e.g., PostgreSQL, Snowflake).
+
+        Args:
+            catalog: Optional catalog filter. Leave blank to rely on connector defaults.
+            database: Optional database filter. Leave blank to rely on connector defaults.
+            datasource: Optional datasource to route the query to. Defaults to the current datasource.
+            include_sys: Set True to include system schemas; defaults to False.
+
+        Returns:
+            FuncToolResult with result holding the schema name list. On failure success=0 with an explanatory message.
+        """
+        try:
+            if database and not self._database_matches_scope(catalog, database):
+                return FuncToolResult(result=[])
+            connector = self._get_connector(datasource)
+            schemas = connector.get_schemas(catalog, database, include_sys=include_sys)
+            filtered = [schema for schema in schemas if self._schema_matches_scope(catalog, database, schema)]
+            return FuncToolResult(result=filtered)
+        except Exception as e:
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool()
+    def list_tables(
+        self,
+        catalog: Optional[str] = "",
+        database: Optional[str] = "",
+        schema_name: Optional[str] = "",
+        datasource: Optional[str] = "",
+        include_views: Optional[bool] = True,
+    ) -> FuncToolResult:
+        """
+        Return table-like objects (tables, views, materialized views) visible to the connector.
+        Args:
+            catalog: Optional catalog filter.
+            database: Optional database filter.
+            schema_name: Optional schema filter.
+            datasource: Optional datasource to route the query to. Defaults to the current datasource.
+            include_views: When True (default) also include views and materialized views.
+
+        Returns:
+            FuncToolResult with result=[{"type": "table|view|materialized_view", "name": str}, ...]. On failure
+            success=0 with an explanatory error message.
+        """
+        try:
+            connector = self._get_connector(datasource)
+            result = []
+            for tb in connector.get_tables(catalog, database, schema_name):
+                result.append({"type": "table", "name": tb})
+
+            if include_views:
+                # Add views. We deliberately swallow any exception — some connectors
+                # don't support views (NotImplementedError/AttributeError), and others
+                # raise real SQL errors when the system view the adapter targets is
+                # missing on that DB version. Failing list_tables entirely for a
+                # subordinate listing would hide the tables we already fetched.
+                try:
+                    views = connector.get_views(catalog, database, schema_name)
+                    for view in views:
+                        result.append({"type": "view", "name": view})
+                except Exception as e:
+                    logger.debug(f"get_views unavailable on {connector.dialect}: {e}")
+
+                # Add materialized views (same reasoning as views above).
+                try:
+                    materialized_views = connector.get_materialized_views(catalog, database, schema_name)
+                    for mv in materialized_views:
+                        result.append({"type": "materialized_view", "name": mv})
+                except Exception as e:
+                    logger.debug(f"get_materialized_views unavailable on {connector.dialect}: {e}")
+
+            filtered_result = self._filter_table_entries(result, catalog, database, schema_name)
+            return FuncToolResult(result=filtered_result)
+        except Exception as e:
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool()
+    def describe_table(
+        self,
+        table_name: str,
+        catalog: Optional[str] = "",
+        database: Optional[str] = "",
+        schema_name: Optional[str] = "",
+        datasource: Optional[str] = "",
+    ) -> FuncToolResult:
+        """
+        Fetch detailed column metadata, enriched with Semantic Model information.
+        Use this tool to understand the table schema and business meanings.
+
+        Args:
+            table_name: Table identifier to describe.
+            catalog: Optional catalog override.
+            database: Optional database override.
+            schema_name: Optional schema override.
+            datasource: Optional datasource to route the query to. Defaults to the current datasource.
+
+        Returns:
+            FuncToolResult with a dictionary containing:
+            - columns (list): List of column dictionaries, each containing:
+              - name (str): Column name (required)
+              - type (str): Column data type (required)
+              - comment (str): Column description/comment, enriched with semantic model description if available
+              - is_dimension (bool): Whether this column is a dimension in semantic model
+                (semantic fields only present if semantic model exists)
+            - table (dict, optional): Table-level metadata from semantic model (only if model exists):
+              - name (str): Name of the table
+              - description (str): Table description from semantic model
+        """
+        try:
+            coordinate = self._build_table_coordinate(
+                raw_name=table_name,
+                catalog=catalog,
+                database=database,
+                schema=schema_name,
+            )
+
+            if not self._table_matches_scope(coordinate):
+                error_msg = f"Table '{table_name}' is outside the scoped context."
+                logger.warning(error_msg)
+                return FuncToolResult(
+                    success=0,
+                    error=error_msg,
+                )
+
+            # 1. Get Physical Schema
+            # Use parsed coordinate fields so that dotted names like "raw.stage"
+            # are correctly split into schema="raw", table="stage" before passing
+            # to the connector (avoids DuckDB treating "raw" as a catalog).
+            connector = self._get_connector(datasource)
+            column_result = connector.get_schema(
+                catalog_name=coordinate.catalog or catalog,
+                database_name=coordinate.database,
+                schema_name=coordinate.schema or schema_name,
+                table_name=coordinate.table,
+            )
+            logger.debug(f"Got {len(column_result)} columns from connector")
+
+            # 2. Normalize columns to ensure required fields
+            columns = []
+            for col in column_result:
+                normalized_col = {
+                    "name": col.get("name", ""),
+                    "type": col.get("type", ""),
+                    "comment": col.get("comment", "") or "",  # Ensure empty string if None
+                }
+                columns.append(normalized_col)
+
+            # 3. Enrich with Semantic Model Info if available
+            result_data = {"columns": columns}
+
+            if self.has_semantic_models:
+                try:
+                    logger.debug("Checking for semantic models")
+                    # Use coordinate values (resolved and stripped) for lookup
+                    model = self._get_semantic_model(
+                        coordinate.catalog,
+                        coordinate.database,
+                        coordinate.schema,
+                        coordinate.table,
+                    )
+
+                    if model:
+                        logger.debug(f"Found semantic model: {model.get('semantic_model_name', 'unknown')}")
+
+                        # Add table-level metadata
+                        result_data["table"] = {
+                            "name": model.get("semantic_model_name", ""),
+                            "description": model.get("description", ""),
+                        }
+
+                        # Create lookup map using expr (physical column) as key, fallback to name
+                        # expr is the actual column name/expression, name is the semantic name
+                        dimensions = model.get("dimensions", [])
+
+                        # Build map: physical_col_name -> dimension_data
+                        dim_map = {(d.get("expr") or d.get("name", "")).lower(): d for d in dimensions}
+
+                        logger.debug(f"Semantic map: {len(dim_map)} dimensions")
+
+                        # Enrich columns with dimension info
+                        if dim_map:
+                            for col in columns:
+                                col_name = col["name"].lower()
+
+                                if col_name in dim_map:
+                                    dim_data = dim_map[col_name]
+                                    col["is_dimension"] = True
+                                    if dim_data.get("description"):
+                                        col["comment"] = dim_data.get("description")
+                                else:
+                                    col["is_dimension"] = False
+                        else:
+                            logger.debug("No dimensions defined in model")
+                    else:
+                        logger.debug("No semantic model found for this table")
+                except Exception as e:
+                    # If semantic model lookup fails, just log and continue with physical schema only
+                    logger.warning(f"Failed to get semantic model for {table_name}: {e}")
+
+            logger.info(f"describe_table succeeded for {table_name}, returning {len(columns)} columns")
+            return FuncToolResult(result=result_data)
+
+        except Exception as e:
+            import traceback
+
+            error_msg = f"Error describing table {table_name}: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return FuncToolResult(success=0, error=error_msg)
+
+    @mcp_tool()
+    def read_query(self, sql: str, datasource: Optional[str] = "") -> FuncToolResult:
+        """
+        Execute a read-only SQL query and return the result rows (optionally compressed).
+
+        Only SELECT, SHOW/DESCRIBE, and EXPLAIN statements are allowed.
+        DML (INSERT/UPDATE/DELETE) and DDL (CREATE/ALTER/DROP) are rejected.
+
+        Args:
+            sql: Read-only SQL text (SELECT, SHOW, DESCRIBE, EXPLAIN), or a .sql file path
+                 (e.g. "sql/session_1/query.sql") to read and execute from the workspace.
+            datasource: Optional datasource name for multi-datasource scenarios.
+
+        Returns:
+            FuncToolResult with result=self.compressor.compress(rows) when successful. On failure success=0 with the
+            underlying error message from the connector.
+        """
+        from dataengineer.utils.sql_utils import _first_statement, parse_sql_type
+
+        try:
+            # Support SQL file path: if sql is a simple path ending with .sql, read from file
+            sql_stripped = sql.strip()
+            if sql_stripped.endswith(".sql") and "\n" not in sql_stripped and " " not in sql_stripped:
+                sql = self._read_sql_from_file(sql_stripped)
+
+            # Reject multi-statement SQL to prevent read-only bypass (e.g. "SELECT 1; DELETE ...")
+            from dataengineer.utils.sql_utils import strip_sql_comments
+
+            cleaned = strip_sql_comments(sql).strip()
+            normalized_sql = cleaned.rstrip(";").strip()
+            if normalized_sql and _first_statement(normalized_sql) != normalized_sql:
+                return FuncToolResult(
+                    success=0,
+                    error="Multi-statement SQL is not allowed. Please submit one query at a time.",
+                )
+
+            # Enforce read-only: only SELECT, SHOW/DESCRIBE, and EXPLAIN are allowed
+            connector = self._get_connector(datasource)
+            sql_type = parse_sql_type(sql, connector.dialect)
+            _READONLY_SQL_TYPES = {SQLType.SELECT, SQLType.METADATA_SHOW, SQLType.EXPLAIN}
+            if sql_type not in _READONLY_SQL_TYPES:
+                return FuncToolResult(
+                    success=0,
+                    error=f"Only read-only queries (SELECT, SHOW, DESCRIBE, EXPLAIN) are allowed. "
+                    f"Detected SQL type: {sql_type.value}",
+                )
+
+            # Reject writable PRAGMAs (e.g. "PRAGMA journal_mode=WAL")
+            if sql_type == SQLType.METADATA_SHOW:
+                first_word = cleaned.split()[0].upper() if cleaned else ""
+                if first_word == "PRAGMA" and "=" in cleaned:
+                    return FuncToolResult(
+                        success=0,
+                        error="Writable PRAGMA statements are not allowed in read-only mode.",
+                    )
+
+            # Check table scope — reject queries referencing out-of-scope tables
+            out_of_scope = self._check_sql_table_scope(sql)
+            if out_of_scope:
+                return FuncToolResult(
+                    success=0,
+                    error=f"Query references tables outside scoped context: {', '.join(out_of_scope)}",
+                )
+
+            logger.info("read_query", sql_type=sql_type.value, datasource=datasource or "default")
+            result = connector.execute_query(sql, result_format="arrow" if connector.dialect == "snowflake" else "list")
+            if result.success:
+                data = result.sql_return
+                return FuncToolResult(result=self.compressor.compress(data))
+            else:
+                return FuncToolResult(success=0, error=result.error)
+        except Exception as e:
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool()
+    def get_table_ddl(
+        self,
+        table_name: str,
+        catalog: Optional[str] = "",
+        database: Optional[str] = "",
+        schema_name: Optional[str] = "",
+        datasource: Optional[str] = "",
+    ) -> FuncToolResult:
+        """
+        Return the connector's DDL definition for the requested table.
+
+        Use this when the agent needs a full CREATE statement (e.g. for semantic modelling or schema verification).
+
+        Args:
+            table_name: Target table identifier (supports partial qualification).
+            catalog: Optional catalog override.
+            database: Optional database override.
+            schema_name: Optional schema override.
+            datasource: Optional datasource to route the query to. Defaults to the current datasource.
+
+        Returns:
+            FuncToolResult with result dict containing keys:
+                identifier, catalog_name, database_name, schema_name, table_name, table_type, definition.
+            Scoped-context mismatches or connector failures surface as success=0 with an explanatory message.
+        """
+        try:
+            coordinate = self._build_table_coordinate(
+                raw_name=table_name,
+                catalog=catalog,
+                database=database,
+                schema=schema_name,
+            )
+            if not self._table_matches_scope(coordinate):
+                return FuncToolResult(
+                    success=0,
+                    error=f"Table '{table_name}' is outside the scoped context.",
+                )
+            # Get tables with DDL
+            connector = self._get_connector(datasource)
+            tables_with_ddl = connector.get_tables_with_ddl(
+                catalog_name=catalog, database_name=database, schema_name=schema_name, tables=[table_name]
+            )
+
+            if not tables_with_ddl:
+                return FuncToolResult(success=0, error=f"Table '{table_name}' not found or no DDL available")
+
+            # Return the first (and only) table's DDL
+            table_info = tables_with_ddl[0]
+            return FuncToolResult(result=table_info)
+
+        except Exception as e:
+            return FuncToolResult(success=0, error=str(e))
+
+    # Regex matching allowed DDL statement prefixes
+    _ALLOWED_DDL_RE = re.compile(
+        r"^\s*(CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:TEMPORARY|TEMP)\s+)?(?:TABLE|VIEW)"
+        r"|CREATE\s+SCHEMA(?:\s+IF\s+NOT\s+EXISTS)?"
+        r"|DROP\s+SCHEMA(?:\s+IF\s+EXISTS)?"
+        r"|ALTER\s+TABLE"
+        r"|DROP\s+(?:TABLE|VIEW)(?:\s+IF\s+EXISTS)?)\b",
+        re.IGNORECASE,
+    )
+
+    def execute_ddl(self, sql: str, datasource: Optional[str] = "") -> FuncToolResult:
+        """
+        Execute a DDL SQL statement (CREATE TABLE AS SELECT, ALTER TABLE, etc.).
+
+        CAUTION: This modifies the database. Only use when explicitly instructed.
+        Supported statements: CREATE TABLE, CREATE TABLE AS SELECT (CTAS),
+        CREATE/DROP SCHEMA, ALTER TABLE, DROP TABLE, CREATE VIEW, DROP VIEW.
+
+        Args:
+            sql: DDL SQL statement to execute
+            datasource: Optional datasource name for multi-datasource scenarios.
+
+        Returns:
+            Execution result with success status
+        """
+        from dataengineer.utils.sql_utils import strip_sql_comments
+
+        # Validate: strip comments, reject multi-statement SQL
+        cleaned = strip_sql_comments(sql).strip().rstrip(";").strip()
+        if not cleaned:
+            return FuncToolResult(success=0, error="Empty SQL statement")
+
+        if ";" in cleaned:
+            return FuncToolResult(
+                success=0,
+                error="Multi-statement SQL is not allowed. Please submit one DDL statement at a time.",
+            )
+
+        # Validate: only allow DDL statement types
+        if not self._ALLOWED_DDL_RE.match(cleaned):
+            return FuncToolResult(
+                success=0,
+                error="Only DDL statements are allowed (CREATE/DROP SCHEMA, CREATE TABLE/VIEW, ALTER TABLE, "
+                "DROP TABLE/VIEW). DML statements (INSERT, UPDATE, DELETE, SELECT) are not permitted.",
+            )
+
+        out_of_scope = self._check_sql_table_scope(cleaned)
+        if out_of_scope:
+            return FuncToolResult(
+                success=0,
+                error=f"DDL statement references tables outside scoped context: {', '.join(out_of_scope)}",
+            )
+
+        connector = self._get_connector(datasource)
+        if not hasattr(connector, "execute_ddl"):
+            return FuncToolResult(success=0, error="Current database connector does not support DDL operations")
+        try:
+            result = connector.execute_ddl(cleaned)
+            if result.success:
+                # Commit to release locks (critical for SQLAlchemy-based connectors)
+                if hasattr(connector, "connection") and hasattr(connector.connection, "commit"):
+                    connector.connection.commit()
+                return FuncToolResult(
+                    result={
+                        "message": "DDL executed successfully",
+                        "sql": cleaned,
+                        "datasource": datasource or self._default_datasource,
+                    }
+                )
+            else:
+                return FuncToolResult(success=0, error=result.error)
+        except Exception as e:
+            return FuncToolResult(success=0, error=f"DDL execution failed: {str(e)}")
+
+    def execute_write(
+        self,
+        sql: str,
+        datasource: Optional[str] = "",
+        min_rows: Optional[int] = None,
+        max_rows: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> FuncToolResult:
+        """
+        Execute a single write statement against the current database connection.
+
+        Supported statements: INSERT, UPDATE, DELETE.
+        Multi-statement SQL, read-only queries, DDL, and MERGE are rejected.
+
+        Args:
+            sql: Write SQL statement to execute, or a .sql file path.
+            datasource: Optional datasource name for multi-datasource scenarios.
+            min_rows: Optional minimum acceptable affected row count.
+                Checked after the write is committed; violation returns success=0
+                but the write is NOT rolled back.
+            max_rows: Optional maximum acceptable affected row count.
+                Checked after the write is committed; violation returns success=0
+                but the write is NOT rolled back.
+            dry_run: Reserved for future transactional preview support. Currently unsupported.
+
+        Returns:
+            FuncToolResult with execution metadata when successful.
+        """
+        from dataengineer.utils.sql_utils import _first_statement, parse_sql_type, strip_sql_comments
+
+        if dry_run:
+            return FuncToolResult(
+                success=0,
+                error="dry_run is not supported yet for execute_write. Use dry_run=False.",
+            )
+
+        try:
+            sql_stripped = sql.strip()
+            if sql_stripped.endswith(".sql") and "\n" not in sql_stripped and " " not in sql_stripped:
+                sql = self._read_sql_from_file(sql_stripped)
+
+            cleaned = strip_sql_comments(sql).strip()
+            normalized_sql = cleaned.rstrip(";").strip()
+            if not normalized_sql:
+                return FuncToolResult(success=0, error="Empty SQL statement")
+
+            if _first_statement(normalized_sql) != normalized_sql:
+                return FuncToolResult(
+                    success=0,
+                    error="Multi-statement SQL is not allowed. Please submit one write statement at a time.",
+                )
+
+            connector = self._get_connector(datasource)
+            sql_type = parse_sql_type(normalized_sql, connector.dialect)
+            if sql_type == SQLType.MERGE:
+                return FuncToolResult(
+                    success=0,
+                    error="MERGE statements are not supported by execute_write yet.",
+                )
+
+            allowed_sql_types = {SQLType.INSERT, SQLType.UPDATE, SQLType.DELETE}
+            if sql_type not in allowed_sql_types:
+                return FuncToolResult(
+                    success=0,
+                    error=(
+                        "Only single-statement writes (INSERT, UPDATE, DELETE) are allowed. "
+                        f"Detected SQL type: {sql_type.value}"
+                    ),
+                )
+
+            out_of_scope = self._check_sql_table_scope(normalized_sql)
+            if out_of_scope:
+                return FuncToolResult(
+                    success=0,
+                    error=f"Write statement references tables outside scoped context: {', '.join(out_of_scope)}",
+                )
+
+            method_name = {
+                SQLType.INSERT: "execute_insert",
+                SQLType.UPDATE: "execute_update",
+                SQLType.DELETE: "execute_delete",
+            }[sql_type]
+
+            if not hasattr(connector, method_name):
+                return FuncToolResult(
+                    success=0,
+                    error=f"Current database connector does not support {sql_type.value.upper()} operations",
+                )
+
+            result = getattr(connector, method_name)(normalized_sql)
+            if not result.success:
+                return FuncToolResult(success=0, error=result.error)
+
+            # Commit to release locks (critical for SQLAlchemy-based connectors)
+            if hasattr(connector, "connection") and hasattr(connector.connection, "commit"):
+                connector.connection.commit()
+
+            row_count = getattr(result, "row_count", None)
+            if (min_rows is not None or max_rows is not None) and row_count is None:
+                return FuncToolResult(
+                    success=0,
+                    error="Connector did not report row_count but min_rows/max_rows was requested. "
+                    "Cannot verify the safety bound. Note: the write has already been committed.",
+                )
+            if min_rows is not None and row_count is not None and row_count < min_rows:
+                return FuncToolResult(
+                    success=0,
+                    error=f"Write affected {row_count} rows, below min_rows={min_rows}. "
+                    "Note: the write has already been committed.",
+                )
+            if max_rows is not None and row_count is not None and row_count > max_rows:
+                return FuncToolResult(
+                    success=0,
+                    error=f"Write affected {row_count} rows, above max_rows={max_rows}. "
+                    "Note: the write has already been committed.",
+                )
+
+            return FuncToolResult(
+                result={
+                    "message": "Write executed successfully",
+                    "sql": normalized_sql,
+                    "sql_type": sql_type.value,
+                    "row_count": row_count,
+                    "datasource": datasource or self._default_datasource,
+                    "dry_run": dry_run,
+                }
+            )
+        except Exception as e:
+            return FuncToolResult(success=0, error=f"Write execution failed: {str(e)}")
+
+    # Maximum rows allowed in a single transfer (v1 memory constraint)
+    _TRANSFER_MAX_ROWS = 1_000_000
+
+    def transfer_query_result(
+        self,
+        source_sql: str,
+        source_datasource: Optional[str] = "",
+        target_table: str = "",
+        target_datasource: Optional[str] = "",
+        mode: str = "replace",
+        batch_size: int = 5000,
+    ) -> FuncToolResult:
+        """
+        Transfer query results from a source datasource to a target table in another datasource.
+
+        Executes source_sql on source_datasource, fetches the result as a DataFrame,
+        and batch-inserts into target_table on target_datasource.
+
+        Args:
+            source_sql: SQL query to execute on the source datasource.
+            source_datasource: Source datasource name. Uses default datasource if empty.
+            target_table: Fully qualified target table name.
+            target_datasource: Target datasource name. Uses default datasource if empty.
+            mode: Transfer mode - 'replace' (TRUNCATE + INSERT) or 'append' (INSERT only).
+            batch_size: Number of rows per INSERT batch.
+
+        Returns:
+            FuncToolResult with transfer metadata on success.
+        """
+        # Validate batch_size
+        if batch_size <= 0:
+            return FuncToolResult(success=0, error="batch_size must be a positive integer.")
+
+        # Validate target_table identifier
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$", target_table):
+            return FuncToolResult(
+                success=0,
+                error=f"Invalid target_table identifier: '{target_table}'. "
+                "Only alphanumeric characters, underscores, and dots are allowed.",
+            )
+
+        # Validate mode
+        if mode not in ("replace", "append"):
+            return FuncToolResult(
+                success=0,
+                error=f"Invalid mode '{mode}'. Supported modes: 'replace', 'append'.",
+            )
+
+        # Validate source_sql: must be a single read-only statement
+        from dataengineer.utils.sql_utils import _first_statement, parse_sql_type, strip_sql_comments
+
+        cleaned_sql = strip_sql_comments(source_sql).strip().rstrip(";").strip()
+        if not cleaned_sql:
+            return FuncToolResult(success=0, error="source_sql is empty.")
+        if _first_statement(cleaned_sql) != cleaned_sql:
+            return FuncToolResult(
+                success=0,
+                error="Multi-statement source_sql is not allowed. Please submit one SELECT query.",
+            )
+        sql_type = parse_sql_type(cleaned_sql, "")
+        if sql_type not in (SQLType.SELECT, SQLType.METADATA_SHOW):
+            return FuncToolResult(
+                success=0,
+                error=f"source_sql must be a SELECT query, got {sql_type.value.upper()}. "
+                "Only read-only queries are allowed as transfer source.",
+            )
+
+        # Get connectors — both must be available; do NOT fall back to a different datasource
+        try:
+            source_conn = self._get_connector(source_datasource)
+        except Exception as e:
+            return FuncToolResult(
+                success=0,
+                error=f"Source datasource '{source_datasource}' is not available: {str(e)}. "
+                "Check that the adapter is installed and the connection config is correct. "
+                "Do NOT fall back to a different source datasource.",
+            )
+        try:
+            target_conn = self._get_connector(target_datasource)
+        except Exception as e:
+            return FuncToolResult(
+                success=0,
+                error=f"Target datasource '{target_datasource}' is not available: {str(e)}. "
+                "Check that the adapter is installed and the connection config is correct. "
+                "Do NOT fall back to a different target datasource — STOP and report this error to the user.",
+            )
+
+        # Execute source query
+        try:
+            if not hasattr(source_conn, "execute_pandas"):
+                return FuncToolResult(
+                    success=0,
+                    error="Source datasource connector does not support pandas execution.",
+                )
+            source_result = source_conn.execute_pandas(source_sql)
+            if not source_result.success:
+                return FuncToolResult(success=0, error=f"Source query failed: {source_result.error}")
+            df = source_result.sql_return
+        except Exception as e:
+            return FuncToolResult(success=0, error=f"Source query execution failed: {str(e)}")
+
+        # Check row limit
+        row_count = len(df)
+        if row_count > self._TRANSFER_MAX_ROWS:
+            return FuncToolResult(
+                success=0,
+                error=f"Result set has {row_count:,} rows, exceeding the {self._TRANSFER_MAX_ROWS:,} row limit. "
+                "Please add WHERE conditions to transfer in smaller batches.",
+            )
+
+        # TRUNCATE for replace mode BEFORE empty check — mode="replace" must clear old data
+        if mode == "replace":
+            try:
+                truncate_result = target_conn.execute_ddl(f"TRUNCATE TABLE {target_table}")
+                if not truncate_result.success:
+                    return FuncToolResult(
+                        success=0,
+                        error=f"Failed to truncate target table: {truncate_result.error}",
+                    )
+            except Exception as e:
+                return FuncToolResult(success=0, error=f"Failed to truncate target table: {str(e)}")
+
+        # Handle empty result (after truncate so replace mode still clears old data)
+        if row_count == 0:
+            logger.info(f"Source query returned 0 rows, nothing to transfer to {target_table}")
+            return FuncToolResult(
+                result={
+                    "message": "Transfer completed (empty result set — target table truncated)"
+                    if mode == "replace"
+                    else "Transfer completed (empty result set)",
+                    "source_sql": source_sql,
+                    "source_datasource": source_datasource,
+                    "target_table": target_table,
+                    "target_datasource": target_datasource or self._default_datasource,
+                    "mode": mode,
+                    "rows_transferred": 0,
+                    "batch_size": batch_size,
+                }
+            )
+
+        # Convert pandas NaT/NaN to Python None for DBAPI2 compatibility
+        df = df.where(df.notna(), other=None)
+        # Also convert numpy types to native Python types
+        df = df.astype(object).where(df.notna(), other=None)
+
+        # Batch INSERT using connector's execute_insert (adapter-agnostic)
+        # Quote column names to handle reserved words (e.g., status, order, select).
+        # Use dialect-appropriate quoting: backticks for MySQL/StarRocks, double quotes for others.
+        columns = list(df.columns)
+        dialect = getattr(target_conn, "dialect", "")
+        backtick_dialects = ("mysql", "starrocks", "hive", "spark", "bigquery", "clickhouse")
+        quote_char = "`" if dialect in backtick_dialects else '"'
+        col_names = ", ".join(f"{quote_char}{c}{quote_char}" for c in columns)
+
+        rows_written = 0
+        try:
+            for batch_start in range(0, row_count, batch_size):
+                batch_end = min(batch_start + batch_size, row_count)
+                batch_df = df.iloc[batch_start:batch_end]
+
+                # Build batch INSERT statement with inline values
+                value_rows = []
+                for _, row in batch_df.iterrows():
+                    values = []
+                    for val in row:
+                        if val is None:
+                            values.append("NULL")
+                        elif isinstance(val, bool):
+                            values.append("TRUE" if val else "FALSE")
+                        elif isinstance(val, (int, float)):
+                            values.append(str(val))
+                        else:
+                            escaped = str(val).replace("'", "''")
+                            values.append(f"'{escaped}'")
+                    value_rows.append(f"({', '.join(values)})")
+
+                insert_sql = f"INSERT INTO {target_table} ({col_names}) VALUES {', '.join(value_rows)}"
+                result = target_conn.execute_insert(insert_sql)
+                if not result.success:
+                    return FuncToolResult(
+                        success=0,
+                        error=f"Transfer failed after writing {rows_written} rows: {result.error}",
+                    )
+                rows_written += len(batch_df)
+
+            # Commit the transaction to release locks (critical for SQLAlchemy-based connectors)
+            if hasattr(target_conn, "connection") and hasattr(target_conn.connection, "commit"):
+                target_conn.connection.commit()
+
+        except Exception as e:
+            return FuncToolResult(
+                success=0,
+                error=f"Transfer failed after writing {rows_written} rows: {str(e)}",
+            )
+
+        logger.info(f"Transferred {rows_written} rows to {target_table} (mode={mode})")
+        return FuncToolResult(
+            result={
+                "message": "Transfer completed successfully",
+                "source_sql": source_sql,
+                "source_datasource": source_datasource,
+                "target_table": target_table,
+                "target_datasource": target_datasource or self._default_datasource,
+                "mode": mode,
+                "rows_transferred": rows_written,
+                "batch_size": batch_size,
+            }
+        )
+
+    # ==================== Migration Target Wrappers ====================
+    #
+    # Thin wrappers over ``MigrationTargetMixin`` methods on the underlying
+    # connector. Uses duck typing so any datus-db-core >= the version that
+    # introduced the Mixin is supported. When the connector does not expose
+    # these methods, we return safe fallback values so the migration agent
+    # can continue in pure-LLM mode.
+
+    def get_migration_capabilities(self, datasource: Optional[str] = "") -> FuncToolResult:
+        """
+        Get migration target hints (dialect_family, requires, forbids, type_hints,
+        example_ddl) for the specified target datasource.
+
+        Args:
+            datasource: Target datasource name. Uses the default datasource if empty.
+
+        Returns:
+            When the adapter implements ``MigrationTargetMixin``:
+              success=1, result = the capability dict.
+            Otherwise:
+              success=1, result = {"supported": False, "warning": "..."}.
+        """
+        try:
+            connector = self._get_connector(datasource)
+        except DataEngineerException as e:
+            return FuncToolResult(success=0, error=str(e))
+
+        if not hasattr(connector, "describe_migration_capabilities"):
+            return FuncToolResult(
+                result={
+                    "supported": False,
+                    "dialect_family": getattr(connector, "dialect", "unknown"),
+                    "warning": (
+                        "Adapter does not expose migration hints (MigrationTargetMixin not implemented); "
+                        "falling back to pure LLM mode. DDL generation will rely on the LLM's own "
+                        "knowledge of this dialect."
+                    ),
+                }
+            )
+
+        try:
+            capabilities = connector.describe_migration_capabilities()
+        except Exception as e:
+            logger.warning(f"describe_migration_capabilities failed on {datasource}: {e}")
+            return FuncToolResult(
+                result={
+                    "supported": False,
+                    "warning": f"Adapter raised while describing capabilities: {e}",
+                }
+            )
+        return FuncToolResult(result=capabilities)
+
+    def suggest_table_layout(self, datasource: Optional[str] = "", columns_json: str = "[]") -> FuncToolResult:
+        """
+        Suggest dialect-specific table layout (distribution/partition/order) for
+        the target datasource, given the source columns.
+
+        Args:
+            datasource: Target datasource name. Uses the default datasource if empty.
+            columns_json: JSON array of source column defs. Each element must
+                be an object with keys ``name`` (str), ``type`` (str), and
+                ``nullable`` (bool). Example::
+
+                    [{"name": "id", "type": "BIGINT", "nullable": false}]
+
+        Returns:
+            When the adapter implements the Mixin: result = suggestion dict
+            (possibly empty for OLTP). Otherwise: result = {}.
+        """
+        try:
+            columns = json.loads(columns_json) if columns_json else []
+        except json.JSONDecodeError as e:
+            return FuncToolResult(success=0, error=f"Invalid columns_json: {e}")
+        if not isinstance(columns, list):
+            return FuncToolResult(success=0, error="columns_json must be a JSON array")
+
+        try:
+            connector = self._get_connector(datasource)
+        except DataEngineerException as e:
+            return FuncToolResult(success=0, error=str(e))
+
+        if not hasattr(connector, "suggest_table_layout"):
+            return FuncToolResult(result={})
+
+        try:
+            suggestion = connector.suggest_table_layout(columns)
+        except Exception as e:
+            logger.warning(f"suggest_table_layout failed on {datasource}: {e}")
+            return FuncToolResult(result={})
+        return FuncToolResult(result=suggestion)
+
+    def validate_ddl(
+        self, datasource: Optional[str] = "", ddl: str = "", target_table: Optional[str] = None
+    ) -> FuncToolResult:
+        """
+        Statically validate a CREATE TABLE DDL against the target dialect's rules.
+        Optionally runs ``dry_run_ddl`` (actual CREATE + DROP to a temp table)
+        when ``target_table`` is provided and the adapter supports it.
+
+        Args:
+            datasource: Target datasource name. Uses the default datasource if empty.
+            ddl: The CREATE TABLE DDL to validate.
+            target_table: If provided, attempt dry-run using this table name.
+
+        Returns:
+            result = {"errors": [...], "validated": true|false}. Empty errors
+            with validated=True means static checks passed.
+            When the adapter has no Mixin, returns validated=False with no errors
+            (the LLM is solely responsible for correctness).
+        """
+        if not ddl or not ddl.strip():
+            return FuncToolResult(success=0, error="Empty DDL statement")
+
+        try:
+            connector = self._get_connector(datasource)
+        except DataEngineerException as e:
+            return FuncToolResult(success=0, error=str(e))
+
+        if not hasattr(connector, "validate_ddl"):
+            return FuncToolResult(result={"errors": [], "validated": False})
+
+        errors: List[str] = []
+        try:
+            static_errors = connector.validate_ddl(ddl)
+            if static_errors:
+                errors.extend(static_errors)
+        except Exception as e:
+            logger.warning(f"validate_ddl static check failed on {datasource}: {e}")
+            errors.append(f"Static check raised unexpectedly: {e}")
+
+        # If static errors were found, skip dry_run — DDL is already invalid.
+        if target_table and not errors and hasattr(connector, "dry_run_ddl"):
+            try:
+                dry_errors = connector.dry_run_ddl(ddl, target_table)
+                if dry_errors:
+                    errors.extend(dry_errors)
+            except NotImplementedError:
+                # Adapter chose not to implement dry-run — static check is the ceiling.
+                pass
+            except Exception as e:
+                logger.warning(f"dry_run_ddl failed on {datasource}: {e}")
+                errors.append(f"Dry-run raised unexpectedly: {e}")
+
+        return FuncToolResult(result={"errors": errors, "validated": True})
+
+
+def db_function_tool_instance(
+    agent_config: AgentConfig, database_name: str = "", sub_agent_name: Optional[str] = None
+) -> DBFuncTool:
+    """Create a DBFuncTool instance. Auto-creates DBManager from agent_config."""
+    return DBFuncTool(
+        agent_config=agent_config,
+        default_datasource=database_name or None,
+        sub_agent_name=sub_agent_name,
+    )
+
+
+def db_function_tool_instance_multi(
+    agent_config: AgentConfig,
+    sub_agent_name: Optional[str] = None,
+    connector_cache_size: int = DBFuncTool.DEFAULT_CONNECTOR_CACHE_SIZE,
+) -> DBFuncTool:
+    """Create a DBFuncTool instance (kept for backward compatibility)."""
+    return DBFuncTool(
+        agent_config=agent_config,
+        sub_agent_name=sub_agent_name,
+        connector_cache_size=connector_cache_size,
+    )
+
+
+def db_function_tools(
+    agent_config: AgentConfig, database_name: str = "", sub_agent_name: Optional[str] = None
+) -> List[Tool]:
+    return db_function_tool_instance(agent_config, database_name, sub_agent_name).available_tools()
