@@ -1,0 +1,532 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+# -*- coding: utf-8 -*-
+from typing import Any, Dict, List, Literal, Optional
+
+from agents import Tool
+
+from dataengineer.configuration.agent_config import AgentConfig
+from dataengineer.schemas.agent_models import SubAgentConfig
+from dataengineer.storage.ext_knowledge.store import ExtKnowledgeRAG
+from dataengineer.storage.metric.store import MetricRAG
+from dataengineer.storage.reference_sql.store import ReferenceSqlRAG
+from dataengineer.storage.reference_template.store import ReferenceTemplateRAG
+from dataengineer.storage.semantic_model.store import SemanticModelRAG
+from dataengineer.tools.func_tool.base import FuncToolResult, normalize_null, trans_to_function_tool
+from dataengineer.utils.loggings import get_logger
+from dataengineer.utils.mcp_decorators import mcp_tool, mcp_tool_class
+
+logger = get_logger(__name__)
+
+
+_NAME = "context_search_tools"
+_NAME_LIST_SUBJECT_TREE = "context_search_tools.list_subject_tree"
+_NAME_METRICS = "context_search_tools.search_metrics"
+_NAME_GET_METRICS = "context_search_tools.get_metrics"
+_NAME_SQL = "context_search_tools.search_reference_sql"
+_NAME_GET_SQL = "context_search_tools.get_reference_sql"
+_NAME_SEMANTIC = "context_search_tools.search_semantic_objects"
+_NAME_KNOWLEDGE = "context_search_tools.search_knowledge"
+_NAME_GET_KNOWLEDGE = "context_search_tools.get_knowledge"
+_NAME_TEMPLATE_SEARCH = "reference_template_tools.search_reference_template"
+_NAME_TEMPLATE_GET = "reference_template_tools.get_reference_template"
+_NAME_TEMPLATE_RENDER = "reference_template_tools.render_reference_template"
+
+
+@mcp_tool_class(
+    name="context_tool",
+    availability_property="has_context_tools",
+)
+class ContextSearchTools:
+    @classmethod
+    def create_dynamic(cls, agent_config: AgentConfig, sub_agent_name: Optional[str] = None) -> "ContextSearchTools":
+        """
+        Create ContextSearchTools instance for dynamic mode.
+
+        Args:
+            agent_config: Agent configuration
+            sub_agent_name: Optional sub-agent name
+
+        Returns:
+            ContextSearchTools instance
+        """
+        return cls(agent_config, sub_agent_name=sub_agent_name)
+
+    @classmethod
+    def create_static(
+        cls,
+        agent_config: AgentConfig,
+        sub_agent_name: Optional[str] = None,
+        database_name: Optional[str] = None,
+    ) -> "ContextSearchTools":
+        """
+        Create ContextSearchTools instance for static mode.
+
+        Args:
+            agent_config: Agent configuration
+            sub_agent_name: Optional sub-agent name
+            database_name: Optional database name (unused, for API compatibility)
+
+        Returns:
+            ContextSearchTools instance
+        """
+        return cls(agent_config, sub_agent_name=sub_agent_name)
+
+    def __init__(self, agent_config: AgentConfig, sub_agent_name: Optional[str] = None):
+        self.agent_config = agent_config
+        self.sub_agent_name = sub_agent_name
+        self.metric_rag = MetricRAG(agent_config, sub_agent_name)
+        self.semantic_rag = SemanticModelRAG(agent_config, sub_agent_name)
+        self.reference_sql_store = ReferenceSqlRAG(agent_config, sub_agent_name)
+        self.ext_knowledge_rag = ExtKnowledgeRAG(agent_config, sub_agent_name)
+        self.reference_template_store = ReferenceTemplateRAG(agent_config, sub_agent_name)
+
+        # Initialize SubjectTreeStore for domain hierarchy
+        self.subject_tree = self.metric_rag.storage.subject_tree
+
+        if sub_agent_name:
+            self.sub_agent_config = SubAgentConfig.model_validate(self.agent_config.sub_agent_config(sub_agent_name))
+        else:
+            self.sub_agent_config = None
+        self.has_metrics = self.metric_rag.get_metrics_size() > 0
+        self.has_reference_sql = self.reference_sql_store.get_reference_sql_size() > 0
+        self.has_semantic_objects = self.semantic_rag.get_size() > 0
+        self.has_knowledge = self.ext_knowledge_rag.get_knowledge_size() > 0
+        self.has_reference_templates = self.reference_template_store.get_reference_template_size() > 0
+
+    def _show_metrics(self):
+        return self.has_metrics and (
+            not self.sub_agent_config
+            or _NAME in self.sub_agent_config.tool_list
+            or _NAME_LIST_SUBJECT_TREE in self.sub_agent_config.tool_list
+            or _NAME_METRICS in self.sub_agent_config.tool_list
+            or _NAME_GET_METRICS in self.sub_agent_config.tool_list
+        )
+
+    def _show_sql(self):
+        return self.has_reference_sql and (
+            not self.sub_agent_config
+            or _NAME in self.sub_agent_config.tool_list
+            or _NAME_LIST_SUBJECT_TREE in self.sub_agent_config.tool_list
+            or _NAME_SQL in self.sub_agent_config.tool_list
+            or _NAME_GET_SQL in self.sub_agent_config.tool_list
+        )
+
+    def _show_knowledge(self):
+        return self.has_knowledge and (
+            not self.sub_agent_config
+            or _NAME in self.sub_agent_config.tool_list
+            or _NAME_LIST_SUBJECT_TREE in self.sub_agent_config.tool_list
+            or _NAME_KNOWLEDGE in self.sub_agent_config.tool_list
+            or _NAME_GET_KNOWLEDGE in self.sub_agent_config.tool_list
+        )
+
+    def _show_template(self):
+        return self.has_reference_templates and (
+            not self.sub_agent_config
+            or _NAME in self.sub_agent_config.tool_list
+            or _NAME_LIST_SUBJECT_TREE in self.sub_agent_config.tool_list
+            or _NAME_TEMPLATE_SEARCH in self.sub_agent_config.tool_list
+            or _NAME_TEMPLATE_GET in self.sub_agent_config.tool_list
+            or _NAME_TEMPLATE_RENDER in self.sub_agent_config.tool_list
+        )
+
+    def _show_semantic_objects(self):
+        return self.has_semantic_objects and (
+            not self.sub_agent_config
+            or _NAME in self.sub_agent_config.tool_list
+            or _NAME_SEMANTIC in self.sub_agent_config.tool_list
+        )
+
+    @staticmethod
+    def all_tools_name() -> List[str]:
+        from dataengineer.utils.class_utils import get_public_instance_methods
+
+        result = []
+        for name in get_public_instance_methods(ContextSearchTools).keys():
+            if name == "available_tools":
+                continue
+            result.append(name)
+        return result
+
+    def available_tools(self) -> List[Tool]:
+        tools = []
+        has_subject_tree = False
+
+        if self.has_metrics:
+            for tool in (self.list_subject_tree, self.search_metrics, self.get_metrics):
+                tools.append(trans_to_function_tool(tool))
+            has_subject_tree = True
+
+        if self.has_reference_sql:
+            if not has_subject_tree:
+                tools.append(trans_to_function_tool(self.list_subject_tree))
+                has_subject_tree = True
+            tools.append(trans_to_function_tool(self.search_reference_sql))
+            tools.append(trans_to_function_tool(self.get_reference_sql))
+
+        if self._show_semantic_objects():
+            tools.append(trans_to_function_tool(self.search_semantic_objects))
+
+        if self._show_knowledge():
+            if not has_subject_tree:
+                tools.append(trans_to_function_tool(self.list_subject_tree))
+                has_subject_tree = True
+            tools.append(trans_to_function_tool(self.search_knowledge))
+            tools.append(trans_to_function_tool(self.get_knowledge))
+
+        if self._show_template():
+            if not has_subject_tree:
+                tools.append(trans_to_function_tool(self.list_subject_tree))
+            # Note: reference_template tools are registered via ReferenceTemplateTools class,
+            # but we ensure list_subject_tree is available for navigation
+
+        return tools
+
+    @mcp_tool()
+    def list_subject_tree(self) -> FuncToolResult:
+        """
+        Get the domain-layer taxonomy from subject_tree store with metrics and SQL counts.
+        Use this as the first step to discover available metrics, reference SQL, and knowledge
+        before calling get_metrics, get_reference_sql, or get_knowledge.
+
+        The response has the structure:
+        {
+            "<domain>": {
+                "<layer1>": {
+                    "<layer2>": {
+                        "metrics": <[name1, name2, ...], optional>,
+                        "reference_sql": <[name1, name2, ...], optional>
+                        "knowledge": <[name1, name2, ...], optional>
+                    },
+                    ...
+                },
+                ...
+            },
+            ...
+        }
+
+        Note that the hierarchy of this subject_tree is indeterminate
+        """
+        try:
+            # Collect entries from the new subject-path index (decoupled from the metric/sql payload tables).
+            metrics_entries = self._collect_metrics_entries()
+            sql_entries = self._collect_sql_entries()
+            knowledge_entries = self._collect_knowledge_entries()
+            template_entries = self._collect_template_entries()
+            enriched_tree = {}
+
+            _fill_subject_tree(enriched_tree, metrics_entries, "metrics")
+            _fill_subject_tree(enriched_tree, sql_entries, "reference_sql")
+            _fill_subject_tree(enriched_tree, knowledge_entries, "knowledge")
+            _fill_subject_tree(enriched_tree, template_entries, "reference_template")
+
+            _normalize_subject_tree(enriched_tree)
+
+            logger.debug(f"enriched_tree: {enriched_tree}")
+            return FuncToolResult(result=enriched_tree)
+        except ValueError as exc:
+            return FuncToolResult(success=0, error=str(exc))
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.error(
+                f"Failed to assemble domain taxonomy: {exc}",
+            )
+            return FuncToolResult(success=0, error=str(exc))
+
+    def _collect_metrics_entries(self) -> List[Dict[str, Any]]:
+        if not self._show_metrics():
+            return []
+        try:
+            return self.metric_rag.search_all_metrics(select_fields=["name"])
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Failed to collect metrics taxonomy: %s", exc)
+            return []
+
+    def _collect_sql_entries(self) -> List[Dict[str, Any]]:
+        if not self._show_sql():
+            return []
+        try:
+            return self.reference_sql_store.search_all_reference_sql(select_fields=["name"])
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Failed to collect SQL taxonomy: %s", exc)
+            return []
+
+    def _collect_knowledge_entries(self) -> List[Dict[str, Any]]:
+        if not self._show_knowledge():
+            return []
+        try:
+            knowledge = self.ext_knowledge_rag.store.search_all_knowledge()
+            return knowledge
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Failed to collect ext knowledge: %s", exc)
+            return []
+
+    def _collect_template_entries(self) -> List[Dict[str, Any]]:
+        if not self._show_template():
+            return []
+        try:
+            return self.reference_template_store.search_all_reference_templates(select_fields=["name"])
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Failed to collect reference template taxonomy: %s", exc)
+            return []
+
+    @mcp_tool(availability_check="has_metrics")
+    def search_metrics(
+        self,
+        query_text: str,
+        subject_path: Optional[List[str]] = None,
+        top_n: int = 5,
+    ) -> FuncToolResult:
+        """
+        Search for business metrics and KPIs using natural language queries.
+
+        Args:
+            query_text: Natural language description of the metric (e.g., "revenue metrics", "conversion rates")
+            subject_path: Optional subject hierarchy path (e.g., ['Finance', 'Revenue', 'Q1'])
+            top_n: Maximum number of results to return (default 5)
+
+        Returns:
+            FuncToolResult with list of matching metrics containing name, description, constraint, and sql_query
+        """
+        # Normalize null values from LLM
+        subject_path = normalize_null(subject_path)
+        try:
+            metrics = self.metric_rag.search_metrics(
+                query_text=query_text,
+                subject_path=subject_path,
+                top_n=top_n,
+            )
+            logger.debug(f"result of search_metrics: {metrics}")
+            return FuncToolResult(success=1, error=None, result=metrics)
+        except Exception as e:
+            logger.error(f"Failed to search metrics for '{query_text}': {e}")
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool(availability_check="has_metrics")
+    def get_metrics(self, subject_path: List[str], name: str = "") -> FuncToolResult:
+        """
+        Get metric details by exact subject path and name.
+        Use `search_metrics` for similarity-based search, use this for precise retrieval
+        when you already know the path.
+
+        Args:
+            subject_path: Subject hierarchy path (e.g., ['Finance', 'Revenue', 'Q1'])
+            name: The exact name of the metric
+
+        Returns:
+            FuncToolResult with metric detail containing name, description, constraint, and sql_query
+        """
+        # Normalize null values from LLM
+        name = normalize_null(name) or ""
+        try:
+            metrics = self.metric_rag.get_metrics_detail(
+                subject_path=subject_path,
+                name=name,
+            )
+            logger.debug(f"result of search_metrics: {metrics}")
+            if metrics:
+                return FuncToolResult(success=1, error=None, result=metrics[0])
+            else:
+                return FuncToolResult(success=0, error="No matched result", result=None)
+        except Exception as e:
+            logger.error(f"Failed to get metrics details for `{'/'.join(subject_path)}/{name}`: {str(e)}")
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool(availability_check="has_reference_sql")
+    def search_reference_sql(
+        self, query_text: str, subject_path: Optional[List[str]] = None, top_n: int = 5
+    ) -> FuncToolResult:
+        """
+        Search for reference SQL queries using natural language queries.
+        MUST call `list_subject_tree` first to get the subject path.
+
+        Args:
+            query_text: The natural language query text representing the desired SQL intent.
+            subject_path: Optional subject hierarchy path (e.g., ['Finance', 'Revenue', 'Q1'])
+            top_n: The number of top results to return (default 5).
+
+        Returns:
+            FuncToolResult with list of matching entries, each containing:
+                - 'name': Reference SQL name
+                - 'sql': The SQL query text
+                - 'summary': Brief description of what the SQL does
+                - 'tags': Associated tags
+        """
+        # Normalize null values from LLM
+        subject_path = normalize_null(subject_path)
+        try:
+            result = self.reference_sql_store.search_reference_sql(
+                query_text=query_text,
+                subject_path=subject_path,
+                top_n=top_n,
+                selected_fields=["name", "sql", "summary", "tags"],
+            )
+            return FuncToolResult(success=1, error=None, result=result)
+        except Exception as e:
+            logger.error(f"Failed to search reference SQL for `{query_text}`: {e}")
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool(availability_check="has_reference_sql")
+    def get_reference_sql(self, subject_path: List[str], name: str = "") -> FuncToolResult:
+        """
+        Get reference SQL detail by exact subject path and name.
+
+        Args:
+            subject_path: Subject hierarchy path (e.g., ['Finance', 'Revenue', 'Q1'])
+            name: The exact name of the reference SQL intent.
+
+        Returns:
+            FuncToolResult with a single matching entry containing:
+                - 'name': Reference SQL name
+                - 'sql': The SQL query text
+                - 'summary': Brief description of what the SQL does
+                - 'tags': Associated tags
+            Returns success=0 with error="No matched result" if not found.
+        """
+        # Normalize null values from LLM
+        name = normalize_null(name) or ""
+        try:
+            result = self.reference_sql_store.get_reference_sql_detail(
+                subject_path=subject_path, name=name, selected_fields=["name", "sql", "summary", "tags"]
+            )
+            if len(result) > 0:
+                return FuncToolResult(success=1, error=None, result=result[0])
+            return FuncToolResult(success=0, error="No matched result", result=None)
+        except Exception as e:
+            logger.error(f"Failed to get reference SQL for `{'/'.join(subject_path)}/{name}`: {e}")
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool(availability_check="has_semantic_objects")
+    def search_semantic_objects(
+        self,
+        query_text: str,
+        kinds: Optional[List[str]] = None,
+        top_n: int = 5,
+    ) -> FuncToolResult:
+        """
+        Search for semantic objects (metrics, columns, tables) using unified storage.
+
+        Args:
+            query_text: Natural language query describing what you're looking for
+            kinds: List of object kinds to filter by. Options: ["metric", "column", "table", "entity"]
+                   If None, searches all kinds
+            top_n: Maximum number of results to return (default 5)
+
+        Returns:
+            FuncToolResult with list of matching objects containing:
+                - kind: Type of object ("metric", "column", "table", "entity")
+                - name: Object name
+                - description: Detailed description
+                - _distance: Similarity score (lower is better)
+                - Additional fields specific to object kind (e.g., available_dimensions for metrics)
+        """
+        # Normalize null values from LLM
+        kinds = normalize_null(kinds)
+        try:
+            results = self.semantic_rag.storage.search_objects(
+                query_text=query_text,
+                kinds=kinds,
+                top_n=top_n,
+            )
+
+            logger.debug(f"search_semantic_objects results: {results}")
+            return FuncToolResult(success=1, error=None, result=results)
+        except Exception as e:
+            logger.error(f"Failed to search semantic objects for '{query_text}': {str(e)}")
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool(availability_check="has_knowledge")
+    def search_knowledge(
+        self, query_text: str, subject_path: Optional[List[str]] = None, top_n: int = 5
+    ) -> FuncToolResult:
+        """
+        Search for external business knowledge using natural language queries.
+
+        Args:
+            query_text: The natural language query text for searching knowledge entries.
+            subject_path: Optional subject hierarchy path (e.g., ['Finance', 'Revenue', 'Q1'])
+            top_n: The number of top results to return (default 5).
+
+        Returns:
+            FuncToolResult with keys:
+                - 'success' (int): 1 if the search succeeded, 0 otherwise.
+                - 'error' (str or None): Error message if any.
+                - 'result' (list): On success, a list of matching entries, each containing:
+                    - 'search_text': Business search_text/concept
+                    - 'explanation': Detailed explanation of the search_text
+        """
+        # Normalize null values from LLM
+        subject_path = normalize_null(subject_path)
+        try:
+            result = self.ext_knowledge_rag.query_knowledge(
+                query_text=query_text,
+                subject_path=subject_path,
+                top_n=top_n,
+            )
+            logger.debug(f"result of search_knowledge: {result}")
+            return FuncToolResult(success=1, error=None, result=result)
+        except Exception as e:
+            logger.error(f"Failed to search knowledge for `{query_text}`: {e}")
+            return FuncToolResult(success=0, error=str(e))
+
+    @mcp_tool(availability_check="has_knowledge")
+    def get_knowledge(self, paths: List[List[str]]) -> FuncToolResult:
+        """
+        Get multiple external business knowledge entries by their full paths.
+        MUST call `list_subject_tree` first to get the tree structure and available knowledge paths.
+
+        Args:
+            paths: List of full paths, where each path is a list containing
+                   subject_path components followed by the knowledge name.
+                   e.g., [['Finance', 'Revenue', 'Q1', 'knowledge_name1'],
+                          ['Sales', 'Marketing', 'knowledge_name2']]
+
+        Returns:
+            FuncToolResult with keys:
+                - 'success' (int): 1 if the search succeeded, 0 otherwise.
+                - 'error' (str or None): Error message if any.
+                - 'result' (list): On success, list of knowledge entries, each containing:
+                    - 'search_text': Business search_text/concept
+                    - 'explanation': Detailed explanation of the search_text
+        """
+        try:
+            if not paths:
+                return FuncToolResult(success=0, error="No paths provided", result=None)
+
+            result = self.ext_knowledge_rag.get_knowledge_batch(paths=paths)
+            logger.debug(f"result of get_knowledge: {result}")
+            if result:
+                return FuncToolResult(success=1, error=None, result=result)
+            else:
+                return FuncToolResult(success=0, error="No matched result", result=None)
+        except Exception as e:
+            logger.error(f"Failed to get knowledge for paths `{paths}`: {e}")
+            return FuncToolResult(success=0, error=str(e))
+
+
+def _fill_subject_tree(
+    enriched_tree: Dict[str, Any],
+    entries: List[Dict[str, Any]],
+    entry_type: Literal["metrics", "reference_sql", "knowledge", "reference_template"],
+):
+    for item in entries:
+        subject_path = item.get("subject_path")
+        if not subject_path:
+            logger.warning("No subject path found, skipping")
+            continue
+        leaf = enriched_tree
+        for layer in subject_path:
+            leaf = leaf.setdefault(layer, {})
+        leaf.setdefault(entry_type, set()).add(item["name"])
+
+
+def _normalize_subject_tree(enriched_tree: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in enriched_tree.items():
+        if key in ("metrics", "reference_sql", "knowledge", "reference_template"):
+            if isinstance(value, set):
+                enriched_tree[key] = sorted(value)
+        elif isinstance(value, dict):
+            _normalize_subject_tree(value)
+    return enriched_tree
