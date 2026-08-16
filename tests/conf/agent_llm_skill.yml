@@ -1,0 +1,39 @@
+agent:
+  target: deepseek
+  models:
+    deepseek:
+      type: deepseek
+      base_url: https://api.deepseek.com
+      api_key: ${DEEPSEEK_API_KEY}
+      model: deepseek-chat
+
+  services:
+    datasources:
+      california_schools:
+        name: california_schools
+        type: sqlite
+        uri: ~/.dataengineer/benchmark/california_schools/california_schools.sqlite
+
+  skills:
+    directories:
+      - ~/.dataengineer/skills
+
+  permissions:
+    default: allow
+    rules:
+      - tool: skills
+        pattern: "*"
+        permission: ask
+
+  agentic_nodes:
+    chat:
+      model: deepseek
+      system_prompt: gen_sql
+      prompt_language: en
+      tools: db_tools.*, context_search_tools.*
+      skills: "*"
+      agent_description: "SQL assistant with skill support for california_schools"
+
+  storage:
+    base_path: data
+    embedding_device_type: cpu

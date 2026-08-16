@@ -1,0 +1,74 @@
+workflow:
+  completion_time: null
+  creation_time: 1743406411.2918038
+  current_node_index: 0
+  db_conn: null
+  description: Test default workflow
+  metadata: {}
+  name: default_workflow
+  node_order:
+  - node_0
+  - node_1
+  - node_2
+  - node_3
+  - node_5
+  nodes:
+  - dependencies: []
+    description: Beginning of the workflow
+    end_time: null
+    id: node_0
+    input: Calculate the total annual revenue from 1992 to 1997 for each combination
+      of customer city and supplier city, where the customer is located in the U.S.
+      cities 'UNITED KI1' or 'UNITED KI5', and the supplier is also located in these
+      two cities. The results should be sorted in ascending order by year and, within
+      each year, in descending order by revenue.
+    metadata: {}
+    result: null
+    start_time: null
+    status: pending
+    type: start
+  - dependencies: []
+    description: Understand the query and find related schemas
+    end_time: null
+    id: node_1
+    input: Calculate the total annual revenue from 1992 to 1997 for each combination
+      of customer city and supplier city, where the customer is located in the U.S.
+      cities 'UNITED KI1' or 'UNITED KI5', and the supplier is also located in these
+      two cities. The results should be sorted in ascending order by year and, within
+      each year, in descending order by revenue.
+    metadata: {}
+    result: null
+    start_time: null
+    status: pending
+    type: schema_linking
+  - dependencies: []
+    description: Generate SQL query
+    end_time: null
+    id: node_2
+    input: null
+    metadata: {}
+    result: null
+    start_time: null
+    status: pending
+    type: generate_sql
+  - dependencies: []
+    description: Execute SQL query
+    end_time: null
+    id: node_3
+    input: null
+    metadata: {}
+    result: null
+    start_time: null
+    status: pending
+    type: execute_sql
+  - dependencies: []
+    description: Return the results to the user
+    end_time: null
+    id: node_5
+    input: null
+    metadata: {}
+    result: null
+    start_time: null
+    status: pending
+    type: output
+  status: pending

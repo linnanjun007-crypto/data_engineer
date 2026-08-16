@@ -1,0 +1,32 @@
+- input:
+    sql_task:
+      database_name: duck
+      schema_name: mf_demo
+      database_type: duckdb
+      external_knowledge: ''
+      id: '2'
+      output_dir: output/duckdb_metrics
+      task: Calculate the cancellation rate by transaction type (Quick Buy or Not Quick Buy).
+    sql_query: |
+      SELECT
+        quick_buy_transaction
+        , CAST(cancellations_usd AS DOUBLE) / CAST(NULLIF(transaction_amount_usd, 0) AS DOUBLE) AS cancellation_rate
+      FROM (
+        SELECT
+          quick_buy_transaction
+          , SUM(transaction_amount_usd) AS transaction_amount_usd
+          , SUM(cancellations_usd) AS cancellations_usd
+        FROM (
+          SELECT
+            CASE
+            WHEN transaction_type_name = 'quick-buy' THEN 'Quick Buy'
+            ELSE 'Not Quick Buy'
+          END
+          AS quick_buy_transaction
+            , transaction_amount_usd
+            , CASE WHEN transaction_type_name = 'cancellation' THEN transaction_amount_usd ELSE 0 END AS cancellations_usd
+          FROM mf_demo.mf_demo_transactions transactions_src_0
+        ) subq_2
+        GROUP BY
+          quick_buy_transaction
+      ) subq_3

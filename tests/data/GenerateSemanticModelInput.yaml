@@ -1,0 +1,13 @@
+- input:
+    sql_task:
+      database_name: duck
+      schema_name: mf_demo
+      database_type: duckdb
+      external_knowledge: ''
+      id: '2'
+      output_dir: output/duckdb_metrics
+      task: 'Generate semantic model for the given SQL query'
+      layer1: duckdb
+      layer2: mf_demo
+      domain: sales
+    table_name: mf_demo_transactions

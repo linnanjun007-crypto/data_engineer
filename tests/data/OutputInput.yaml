@@ -1,0 +1,21 @@
+bird_dev:
+  db_path: ~/benchmark/bird/dev_20240627 #databases path - using ~ for portability
+  output_dir: "tests/output/bird_dev"
+  datasource: bird_school
+  tasks:
+    - question_id: 1464
+      question: "Write the full names of students who received funds on the date of 9/9/2019 and include the amount received."
+      # evidence or knowledge
+      dev_evidence: "full name refers to first_name, last_name, amount of funds received refers to amount, received funds on date refers to date_received"
+      database_name: "student_club"
+      # gen by llm
+      gen_sql: "SELECT m.first_name || ' ' || m.last_name AS full_name, i.amount FROM income i JOIN member m ON i.link_to_member = m.member_id WHERE i.date_received = '2019-09-09';"
+      gold_sql: "SELECT DISTINCT T3.first_name, T3.last_name, T4.amount FROM event AS T1 INNER JOIN attendance AS T2 ON T1.event_id = T2.link_to_event INNER JOIN member AS T3 ON T3.member_id = T2.link_to_member INNER JOIN income AS T4 ON T4.link_to_member = T3.member_id WHERE T4.date_received = '2019-09-09'"
+    - question_id: 1241
+      question: "For patients with abnormal platelet level, state the number of patients with lower than normal range. How is it compare to the number of patients with higher than normal range?"
+      # evidence or knowledge
+      dev_evidence: "abnormal platelet level refers to PLT <= 100 or PLT >= 400; platelet level lower than normal range refers to PLT < 100; calculation = SUBTRACT(SUM(PLT < 100), SUM(PLT > 400)); platelet level higher than normal range refers to PLT > 400;"
+      database_name: "thrombosis_prediction"
+      # gen by llm
+      gen_sql: "SELECT (SELECT COUNT(DISTINCT ID) FROM Laboratory WHERE PLT < 100) AS lower_count, (SELECT COUNT(DISTINCT ID) FROM Laboratory WHERE PLT > 400) AS higher_count;"
+      gold_sql: "SELECT SUM(CASE WHEN T2.PLT <= 100 THEN 1 ELSE 0 END) - SUM(CASE WHEN T2.PLT >= 400 THEN 1 ELSE 0 END) FROM Patient AS T1 INNER JOIN Laboratory AS T2 ON T1.ID = T2.ID"

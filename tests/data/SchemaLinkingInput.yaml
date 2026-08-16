@@ -1,0 +1,21 @@
+- input:
+    database_name: california_schools
+    database_type: sqlite
+    input_text: What is the highest eligible free rate for K-12 students in the schools in Alameda County?
+    matching_rate: fast
+- input:
+    database_name: financial
+    database_type: sqlite
+    input_text: How many accounts who choose issuance after transaction are staying in East Bohemia region?
+    matching_rate: medium
+- input:
+    database_name: toxicology
+    database_type: sqlite
+    input_text: Calculate the average number of oxygen atoms in single-bonded molecules.
+    matching_rate: slow
+
+- input:
+    database_name: card_games
+    database_type: sqlite
+    input_text: Name the card and artist with the most ruling information. Also state if the card is a promotional printing.
+    matching_rate: from_llm

@@ -1,0 +1,241 @@
+agent:
+  # Set home to tests directory so data paths resolve to tests/data instead of ~/.dataengineer/data
+  # Using relative path for portability across different environments
+  home: .dataengineer_test_data
+  target: deepseek
+  project_root: .dataengineer_test_data/workspace
+
+  models:
+    deepseek:
+      type: deepseek
+      base_url: https://api.deepseek.com
+      api_key: ${DEEPSEEK_API_KEY}
+      model: deepseek-chat
+    deepseek-r1:
+      type: deepseek
+      base_url: https://api.deepseek.com
+      api_key: ${DEEPSEEK_API_KEY}
+      model: deepseek-reasoner
+      enable_thinking: true
+    deepseek-ark:
+      type: deepseek
+      base_url: https://ark.cn-beijing.volces.com/api/v3
+      api_key: ${DEEPSEEK_ARK_API_KEY}
+      model: deepseek-v3-250324
+    qwen:
+      type: qwen
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: ${DASHSCOPE_API_KEY}
+      model: qwen3-coder-plus
+    anthropic:
+      type: claude
+      base_url: https://api.anthropic.com
+      api_key: ${ANTHROPIC_API_KEY}
+      #model: claude-3-7-sonnet-latest
+      model: claude-haiku-4-5
+    kimi-k2:
+      type: kimi
+      base_url: https://api.moonshot.cn/v1
+      api_key: ${KIMI_API_KEY}
+      model: kimi-k2.5
+      temperature: 1
+      top_p: 0.95
+      enable_thinking: true
+    openai-4o-mini:
+      type: openai
+      base_url: https://api.openai.com/v1
+      api_key: ${OPENAI_API_KEY}
+      model: gpt-4o-mini
+    gemini-2.5:
+      type: gemini
+      base_url: https://generativelanguage.googleapis.com/v1beta
+      api_key: ${GEMINI_API_KEY}
+      model: gemini-2.5-flash-lite
+      enable_thinking: true
+    claude-subscription:
+      type: claude
+      vendor: anthropic
+      auth_type: subscription
+      api_key: ${CLAUDE_CODE_OAUTH_TOKEN}
+      model: claude-sonnet-4-20250514
+      use_native_api: true
+    codex:
+      type: codex
+      vendor: openai
+      api_key: ${CODEX_OAUTH_TOKEN}
+      model: gpt-5.3-codex
+    openrouter:
+      type: openrouter
+      vendor: openrouter
+      api_key: ${OPENROUTER_API_KEY}
+      model: anthropic/claude-sonnet-4
+
+  nodes:
+    schema_linking:
+      model: deepseek
+      matching_rate: fast
+    generate_sql:
+      model: deepseek
+      max_table_schemas_length: 10000
+      max_data_details_length: 8000
+      max_context_length: 8000
+      max_value_length: 500
+    reasoning:
+      model: deepseek
+      max_table_schemas_length: 10000
+      max_data_details_length: 8000
+      max_context_length: 8000
+      max_value_length: 500
+      max_turns: 20
+    reflect:
+    output:
+      check_result: true
+  # ── Skills configuration ──
+  skills:
+    directories:
+      - tests/data/skills
+    warn_duplicates: true
+
+  # ── Unified permission configuration ──
+  permissions:
+    default: allow
+    rules:
+      - tool: skills
+        pattern: "admin-*"
+        permission: deny
+      - tool: skills
+        pattern: "sql-*"
+        permission: ask
+
+  agentic_nodes:
+    gen_semantic_model:
+      max_turns: 40
+      system_prompt: gen_semantic_model
+    gen_metrics:
+      max_turns: 30
+      system_prompt: gen_metrics
+      prompt_version: "1.1"
+    gen_ext_knowledge:
+      max_turns: 30
+      system_prompt: gen_ext_knowledge
+    gen_sql_summary:
+      max_turns: 30
+      system_prompt: gen_sql_summary
+    chatbot:
+      model: deepseek
+      system_prompt: gen_sql
+      prompt_language: en
+      max_turns: 30
+      tools: db_tools.*, context_search_tools.*, filesystem_tools.*, scheduler_tools.*
+      agent_description: "You are a specialized AI assistant for SQL generation"
+      rules:
+        - Use filesystem tools to read SQL files from the current directory (*/*.sql) as reference examples
+        - When SQL is involved, explain your approach and provide clear, executable queries
+        - Always check reference SQL files(*.sql) in allowed directory for similar patterns before writing new queries
+        - If context is provided, use the tables/metrics/sqls in user prompt
+        - Try to use database specific dialect
+    # ── Integration test nodes with skill/permission configuration ──
+    school_sql:
+      model: deepseek
+      system_prompt: gen_sql
+      prompt_language: en
+      tools: db_tools.*, context_search_tools.*
+      skills: "sql-*"
+      agent_description: "SQL agent with sql-* skills only"
+    school_report:
+      model: deepseek
+      system_prompt: gen_sql
+      prompt_language: en
+      tools: db_tools.*, context_search_tools.*
+      skills: "report-*, data-*"
+      agent_description: "Report agent with report/data skills only"
+    school_all:
+      model: deepseek
+      system_prompt: gen_sql
+      prompt_language: en
+      tools: db_tools.*, context_search_tools.*
+      skills: "*"
+      permissions:
+        rules:
+          - tool: skills
+            pattern: "admin-*"
+            permission: allow
+      agent_description: "Agent with all skills and admin override"
+    school_template:
+      model: deepseek
+      system_prompt: gen_sql
+      prompt_language: en
+      tools: db_tools.*, reference_template_tools.*
+      rules:
+        - Always search reference templates first before writing SQL
+        - Use render_reference_template with appropriate parameters to generate final SQL
+      agent_description: "SQL agent using reference templates for stable SQL output"
+  schema_linking_rate: medium
+
+  # Benchmark data is stored at {agent.home}/benchmark/{name}
+  # Supported benchmarks: bird_dev, spider2, semantic_layer
+
+  # local datasources configuration
+  services:
+    datasources:
+      bird_sqlite:
+        type: sqlite
+        path_pattern: ~/benchmark/bird/dev_20240627/dev_databases/**/*.sqlite # just support glob pattern
+      bird_school:
+        name: california_schools
+        type: sqlite
+        uri: ~/benchmark/bird/dev_20240627/dev_databases/california_schools/california_schools.sqlite # just support glob pattern
+      duckdb:
+        type: duckdb
+        name: duck
+        uri: tests/data/dataengineer_metricflow_db/duck.db # absolute path: sqlite:////full/path/to/example.db
+      local_duckdb:
+        type: duckdb
+        name: ssb
+        uri: sample_data/duckdb-demo.duckdb
+      ssb_sqlite:
+        type: sqlite
+        name: SSB
+        uri: tests/data/SSB.db
+      snowflake:
+        type: snowflake
+        account: ${SNOWFLAKE_ACCOUNT}
+        username: ${SNOWFLAKE_USERNAME}
+        password: ${SNOWFLAKE_PASSWORD}
+      starrocks:
+        type: starrocks
+        host: ${STARROCKS_HOST}
+        port: ${STARROCKS_PORT}
+        username: ${STARROCKS_USER}
+        password: ${STARROCKS_PASSWORD}
+        database: ${STARROCKS_DATABASE}
+      superset:
+        type: postgresql
+        host: 127.0.0.1
+        port: 15432
+        username: superset
+        password: superset
+        database: examples
+    semantic_layer:
+      metricflow: {}
+    bi_platforms:
+      superset:
+        type: superset
+        api_base_url: http://localhost:8088
+        username: admin
+        password: admin
+        extra:
+          provider: db
+    schedulers:
+      airflow_local:
+        name: airflow_local
+        type: airflow
+        api_base_url: http://localhost:8080/api/v1
+        username: admin
+        password: admin123
+        dags_folder: /tmp/dags
+        dag_discovery_timeout: 60
+        dag_discovery_poll_interval: 5
+  storage:
+    base_path: data
+    embedding_device_type: cpu

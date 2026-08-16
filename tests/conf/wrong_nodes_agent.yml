@@ -1,0 +1,5 @@
+agent:
+  nodes:
+    non-existent-node:
+      model: qwen3
+      matching_rate: fast
