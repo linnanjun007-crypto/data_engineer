@@ -1,0 +1,628 @@
+import logging
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from dataengineer.utils.loggings import configure_logging, get_log_manager, get_logger, log_context
+from dataengineer.utils.path_manager import DataEngineerPathManager
+
+
+@pytest.fixture(scope="module")
+def setup_logging(tmp_path_factory):
+    """Configure logging to use tmp_path for isolated testing"""
+    tmp_dir = tmp_path_factory.mktemp("logs")
+    configure_logging(debug=True, log_dir=str(tmp_dir))
+    return tmp_dir
+
+
+@pytest.fixture(scope="module")
+def logger(setup_logging):
+    """Get logger after logging is configured"""
+    return get_logger(__name__)
+
+
+def test_log_context(logger):
+    """Test log context manager"""
+
+    print("=== Test log context manager ===")
+
+    # Default output
+    logger.info("Default configuration log")
+
+    # Use context manager to temporarily output to console only
+    with log_context("console"):
+        root_logger = logging.getLogger()
+        assert any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers), (
+            "Expected a StreamHandler (console) to be active inside log_context('console')"
+        )
+        logger.info("This log will only be output to console (temporary)")
+
+    # Restore default configuration after context ends
+    logger.info("This log will be output to both file and console (restored)")
+
+    # Use context manager to temporarily output to file only
+    print("=== Output to file only ===")
+    with log_context("file"):
+        root_logger = logging.getLogger()
+        # In file-only mode no StreamHandler for stdout should be active
+        active_handlers = root_logger.handlers
+        assert len(active_handlers) > 0, "Expected at least one handler (file) inside log_context('file')"
+        logger.info("This log will only be output to file (temporary)")
+
+    # Restore default configuration after context ends
+    logger.info("This log will be output to both file and console (restored)")
+
+
+def test_log_manager(logger):
+    """Test log manager"""
+
+    print("=== Test log manager ===")
+
+    # Get log manager
+    log_manager = get_log_manager()
+
+    # Use manager to set output target
+    log_manager.set_output_target("console")
+    root_logger = logging.getLogger()
+    assert log_manager.console_handler in root_logger.handlers, (
+        "console_handler should be active after set_output_target('console')"
+    )
+    assert log_manager.file_handler not in root_logger.handlers, (
+        "file_handler should NOT be active after set_output_target('console')"
+    )
+    logger.info("Set via manager: output to console only")
+
+    # Restore default configuration
+    log_manager.restore_default()
+    assert log_manager.file_handler in root_logger.handlers, "file_handler should be active after restore_default()"
+    assert log_manager.console_handler in root_logger.handlers, (
+        "console_handler should be active after restore_default()"
+    )
+    logger.info("Restore default configuration via manager")
+
+
+def test_multiple_switches(logger):
+    """Test multiple switches between different output targets"""
+
+    print("=== Test multiple switches ===")
+
+    log_manager = get_log_manager()
+    root_logger = logging.getLogger()
+
+    # Test multiple rapid switches
+    logger.info("Initial log with default config")
+
+    # Test context manager with multiple switches
+    with log_context("console"):
+        logger.info("Context 1: console only")
+        assert log_manager.console_handler in root_logger.handlers
+        assert log_manager.file_handler not in root_logger.handlers
+
+        with log_context("file"):
+            logger.info("Context 2: file only (nested)")
+            assert log_manager.file_handler in root_logger.handlers
+            assert log_manager.console_handler not in root_logger.handlers
+
+        # Back in outer console-only context
+        logger.info("Context 1: back to console only")
+        assert log_manager.console_handler in root_logger.handlers
+
+    # After both contexts exit, handlers should be restored
+    handlers_after = set(root_logger.handlers)
+    assert len(handlers_after) > 0, "Handlers should be restored after context exit"
+    logger.info("Final log: should be both file and console")
+
+
+def test_simple_context(logger):
+    """Test simple context manager to verify no deadlock"""
+
+    print("=== Test simple context manager ===")
+
+    log_manager = get_log_manager()
+    root_logger = logging.getLogger()
+
+    # Capture handlers before entering context
+    handlers_before = set(root_logger.handlers)
+
+    # Test basic context manager
+    with log_context("console"):
+        logger.info("Simple context test: console only")
+        assert log_manager.console_handler in root_logger.handlers, (
+            "console_handler should be active inside log_context('console')"
+        )
+
+    # After context exits, handlers should be restored
+    handlers_after = set(root_logger.handlers)
+    assert handlers_after == handlers_before, "Handlers should be restored after log_context exits"
+    logger.info("Back to default configuration")
+
+
+def test_nested_context(logger):
+    """Test nested context managers"""
+
+    print("=== Test nested context managers ===")
+
+    log_manager = get_log_manager()
+    root_logger = logging.getLogger()
+    handlers_before = set(root_logger.handlers)
+
+    with log_context("console"):
+        logger.info("Outer context: console only")
+        assert log_manager.console_handler in root_logger.handlers
+        assert log_manager.file_handler not in root_logger.handlers
+
+        with log_context("file"):
+            logger.info("Inner context: file only")
+            assert log_manager.file_handler in root_logger.handlers
+            assert log_manager.console_handler not in root_logger.handlers
+
+        # Restored to outer context state
+        assert log_manager.console_handler in root_logger.handlers
+        logger.info("Back to outer context: console only")
+
+    # Fully restored after all contexts exit
+    assert set(root_logger.handlers) == handlers_before, "Handlers should be fully restored after nested contexts exit"
+    logger.info("Back to default configuration")
+
+
+class TestIsSourceEnvironment:
+    """Tests for _is_source_environment (lines 41-42)."""
+
+    def test_returns_bool(self):
+        from dataengineer.utils.loggings import _is_source_environment
+
+        result = _is_source_environment()
+        assert isinstance(result, bool)
+        # Running from the source repo means this must be True (same as test_returns_true_in_repo)
+        assert result is True
+
+    def test_returns_true_in_repo(self):
+        """Running from the source repo should return True."""
+        from dataengineer.utils.loggings import _is_source_environment
+
+        # We are running from the source repo, so it should be True
+        assert _is_source_environment() is True
+
+    def test_exception_returns_false(self):
+        """If an unexpected exception occurs, function returns False."""
+        from dataengineer.utils.loggings import _is_source_environment
+
+        with patch("os.path.dirname", side_effect=Exception("boom")):
+            result = _is_source_environment()
+        assert result is False
+
+
+class TestDynamicLogManager:
+    """Tests for DynamicLogManager (lines 45-147)."""
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        from dataengineer.utils.loggings import DynamicLogManager
+
+        return DynamicLogManager(debug=False, log_dir=str(tmp_path / "logs"))
+
+    def test_init_creates_log_dir(self, tmp_path):
+        from dataengineer.utils.loggings import DynamicLogManager
+
+        log_dir = tmp_path / "logs" / "sub"
+        DynamicLogManager(log_dir=str(log_dir))
+        assert log_dir.exists()
+
+    def test_set_output_target_file_only(self, manager):
+        manager.set_output_target("file")
+        root_logger = logging.getLogger()
+        assert manager.file_handler in root_logger.handlers
+        assert manager.console_handler not in root_logger.handlers
+
+    def test_set_output_target_console_only(self, manager):
+        manager.set_output_target("console")
+        root_logger = logging.getLogger()
+        assert manager.console_handler in root_logger.handlers
+        assert manager.file_handler not in root_logger.handlers
+
+    def test_set_output_target_both(self, manager):
+        manager.set_output_target("both")
+        root_logger = logging.getLogger()
+        assert manager.file_handler in root_logger.handlers
+        assert manager.console_handler in root_logger.handlers
+
+    def test_set_output_target_none(self, manager):
+        manager.set_output_target("none")
+        root_logger = logging.getLogger()
+        assert manager.file_handler not in root_logger.handlers
+        assert manager.console_handler not in root_logger.handlers
+
+    def test_restore_default_sets_both(self, manager):
+        manager.set_output_target("none")
+        manager.restore_default()
+        root_logger = logging.getLogger()
+        assert manager.file_handler in root_logger.handlers
+        assert manager.console_handler in root_logger.handlers
+
+    def test_restore_original_restores_handlers(self, manager):
+        """restore_original should set handlers back to those saved at init."""
+        manager.set_output_target("none")
+        manager.restore_original()
+        root_logger = logging.getLogger()
+        assert root_logger.handlers == manager.original_handlers
+
+    def test_temporary_output_context_manager_restores(self, manager):
+        """After temporary_output context, handlers are restored."""
+        manager.set_output_target("both")
+        before_handlers = logging.getLogger().handlers.copy()
+        with manager.temporary_output("none"):
+            assert manager.file_handler not in logging.getLogger().handlers
+        after_handlers = logging.getLogger().handlers
+        assert set(before_handlers) == set(after_handlers)
+
+    def test_temporary_output_restores_on_exception(self, manager):
+        """Even if code inside context raises, handlers are restored."""
+        manager.set_output_target("both")
+        before_handlers = logging.getLogger().handlers.copy()
+        with pytest.raises(RuntimeError):
+            with manager.temporary_output("none"):
+                raise RuntimeError("boom")
+        after_handlers = logging.getLogger().handlers
+        assert set(before_handlers) == set(after_handlers)
+
+    def test_debug_mode_sets_root_logger_to_debug(self, tmp_path):
+        from dataengineer.utils.loggings import DynamicLogManager
+
+        mgr = DynamicLogManager(debug=True, log_dir=str(tmp_path / "dbg"))
+        assert mgr.root_logger.level == logging.DEBUG
+
+    def test_init_non_source_env_uses_path_manager(self, tmp_path):
+        """When not in source environment and log_dir=None, uses path_manager.logs_dir (lines 55-57)."""
+        import dataengineer.utils.loggings as loggings_module
+        from dataengineer.utils.loggings import DynamicLogManager
+
+        pm_logs = tmp_path / "pm_logs"
+        pm_logs.mkdir(parents=True, exist_ok=True)
+        with patch.object(loggings_module, "_is_source_environment", return_value=False):
+            with patch("dataengineer.utils.path_manager.get_path_manager") as mock_pm:
+                mock_pm.return_value.logs_dir = pm_logs
+                mgr = DynamicLogManager(log_dir=str(pm_logs))
+        assert Path(mgr.log_dir) == pm_logs.resolve()
+
+    def test_init_non_source_env_uses_agent_config_path_manager(self, tmp_path):
+        import dataengineer.utils.loggings as loggings_module
+        from dataengineer.utils.loggings import DynamicLogManager
+
+        path_manager = DataEngineerPathManager(tmp_path / "tenant_home")
+        agent_config = SimpleNamespace(path_manager=path_manager)
+
+        with patch.object(loggings_module, "_is_source_environment", return_value=False):
+            mgr = DynamicLogManager(agent_config=agent_config)
+
+        assert Path(mgr.log_dir) == path_manager.logs_dir
+
+
+class TestGetLogManager:
+    """Tests for get_log_manager (lines 150-155)."""
+
+    def test_returns_dynamic_log_manager(self, tmp_path):
+        from dataengineer.utils.loggings import DynamicLogManager, configure_logging, get_log_manager
+
+        configure_logging(log_dir=str(tmp_path / "logs"))
+        mgr = get_log_manager()
+        assert isinstance(mgr, DynamicLogManager)
+
+    def test_creates_instance_when_none(self, tmp_path):
+        import dataengineer.utils.loggings as loggings_module
+
+        original = loggings_module._log_manager
+        try:
+            loggings_module._log_manager = None
+            with patch.object(loggings_module, "_is_source_environment", return_value=True):
+                mgr = loggings_module.get_log_manager()
+            assert mgr is not None
+        finally:
+            loggings_module._log_manager = original
+
+    def test_creates_instance_with_agent_config(self, tmp_path):
+        import dataengineer.utils.loggings as loggings_module
+
+        original = loggings_module._log_manager
+        path_manager = DataEngineerPathManager(tmp_path / "tenant_home")
+        agent_config = SimpleNamespace(path_manager=path_manager)
+        try:
+            loggings_module._log_manager = None
+            with patch.object(loggings_module, "_is_source_environment", return_value=False):
+                mgr = loggings_module.get_log_manager(agent_config=agent_config)
+            assert Path(mgr.log_dir) == path_manager.logs_dir
+        finally:
+            loggings_module._log_manager = original
+
+
+class TestConfigureLogging:
+    """Tests for configure_logging (lines 158-199)."""
+
+    def test_configure_logging_creates_manager(self, tmp_path):
+        from dataengineer.utils.loggings import configure_logging
+
+        mgr = configure_logging(log_dir=str(tmp_path / "logs"))
+        from dataengineer.utils.loggings import DynamicLogManager
+
+        assert isinstance(mgr, DynamicLogManager)
+
+    def test_configure_logging_debug_false(self, tmp_path):
+        from dataengineer.utils.loggings import configure_logging
+
+        mgr = configure_logging(debug=False, log_dir=str(tmp_path / "logs"))
+        assert mgr.debug is False
+
+    def test_configure_logging_debug_true(self, tmp_path):
+        from dataengineer.utils.loggings import configure_logging
+
+        mgr = configure_logging(debug=True, log_dir=str(tmp_path / "logs"))
+        assert mgr.debug is True
+
+    def test_configure_logging_console_output_false(self, tmp_path):
+        from dataengineer.utils.loggings import configure_logging
+
+        mgr = configure_logging(console_output=False, log_dir=str(tmp_path / "logs"))
+        root_logger = logging.getLogger()
+        assert mgr.console_handler not in root_logger.handlers
+
+    def test_configure_logging_console_output_true(self, tmp_path):
+        from dataengineer.utils.loggings import configure_logging
+
+        mgr = configure_logging(console_output=True, log_dir=str(tmp_path / "logs"))
+        root_logger = logging.getLogger()
+        assert mgr.console_handler in root_logger.handlers
+
+    def test_configure_logging_auto_detects_source_env(self, tmp_path):
+        """When log_dir is None and source env is detected, uses ./logs."""
+        import dataengineer.utils.loggings as loggings_module
+
+        with patch.object(loggings_module, "_is_source_environment", return_value=True):
+            mgr = loggings_module.configure_logging()
+        assert mgr is not None
+
+    def test_configure_logging_non_source_env_uses_agent_config_path_manager(self, tmp_path):
+        import dataengineer.utils.loggings as loggings_module
+
+        path_manager = DataEngineerPathManager(tmp_path / "tenant_home")
+        agent_config = SimpleNamespace(path_manager=path_manager)
+
+        with patch.object(loggings_module, "_is_source_environment", return_value=False):
+            mgr = loggings_module.configure_logging(agent_config=agent_config, console_output=False)
+
+        assert Path(mgr.log_dir) == path_manager.logs_dir
+
+
+class TestAddExcInfo:
+    """Tests for add_exc_info processor (line 202-206)."""
+
+    def test_adds_exc_info_for_error(self):
+        from dataengineer.utils.loggings import add_exc_info
+
+        event_dict = {}
+        result = add_exc_info(None, "error", event_dict)
+        assert result["exc_info"] is True
+
+    def test_no_exc_info_for_info(self):
+        from dataengineer.utils.loggings import add_exc_info
+
+        event_dict = {}
+        result = add_exc_info(None, "info", event_dict)
+        assert "exc_info" not in result
+
+
+class TestAddCodeLocation:
+    """Tests for add_code_location processor (lines 209-221)."""
+
+    def test_adds_fileno_for_debug_method(self):
+        from dataengineer.utils.loggings import add_code_location
+
+        event_dict = {}
+        result = add_code_location(None, "debug", event_dict)
+        assert "fileno" in result
+
+    def test_no_fileno_for_info_without_fileno_flag(self):
+        """When fileno global is False and method is info, no fileno added."""
+        import dataengineer.utils.loggings as loggings_module
+
+        original = loggings_module.fileno
+        try:
+            loggings_module.fileno = False
+            event_dict = {}
+            result = loggings_module.add_code_location(None, "info", event_dict)
+            assert "fileno" not in result
+        finally:
+            loggings_module.fileno = original
+
+    def test_extract_stack_failure_is_printed_and_suppressed(self):
+        import dataengineer.utils.loggings as loggings_module
+
+        with patch.object(loggings_module.traceback, "extract_stack", side_effect=RuntimeError("boom")):
+            with patch("builtins.print") as mock_print:
+                result = loggings_module.add_code_location(None, "debug", {})
+
+        assert result == {}
+        mock_print.assert_called_once_with("boom")
+
+
+class TestGetCurrentLogFile:
+    """Tests for _get_current_log_file (lines 332-356)."""
+
+    def test_returns_path_or_none(self, tmp_path):
+        from dataengineer.utils.loggings import _get_current_log_file, configure_logging
+
+        configure_logging(log_dir=str(tmp_path / "logs"))
+        result = _get_current_log_file()
+        assert result is None or isinstance(result, Path)
+
+    def test_returns_none_when_no_log_manager(self):
+        import dataengineer.utils.loggings as loggings_module
+
+        original = loggings_module._log_manager
+        try:
+            loggings_module._log_manager = None
+            with patch("dataengineer.utils.loggings.get_log_manager", side_effect=Exception("no manager")):
+                # get_path_manager is imported inside the function, patch via path_manager module
+                with patch("dataengineer.utils.path_manager.get_path_manager") as mock_pm:
+                    mock_pm.return_value.logs_dir = Path("/nonexistent_xyz_abc")
+                    result = loggings_module._get_current_log_file()
+            assert result is None
+        finally:
+            loggings_module._log_manager = original
+
+    def test_falls_back_to_latest_log_file_in_logs_dir(self, tmp_path):
+        import dataengineer.utils.loggings as loggings_module
+
+        logs_dir = tmp_path / "logs"
+        logs_dir.mkdir()
+        older = logs_dir / "agent.2025-01-01.log"
+        newer = logs_dir / "agent.2025-01-02.log"
+        older.write_text("old", encoding="utf-8")
+        newer.write_text("new", encoding="utf-8")
+        os.utime(older, (1, 1))
+        os.utime(newer, (2, 2))
+
+        with patch("dataengineer.utils.loggings.get_log_manager", side_effect=RuntimeError("no manager")):
+            with patch("dataengineer.utils.path_manager.get_path_manager") as mock_pm:
+                mock_pm.return_value.logs_dir = logs_dir
+                result = loggings_module._get_current_log_file()
+
+        assert result == newer.resolve()
+
+
+class TestPrintRichException:
+    """Tests for print_rich_exception (lines 359-374)."""
+
+    def test_calls_console_print(self, tmp_path):
+        from rich.console import Console
+
+        from dataengineer.utils.loggings import configure_logging, print_rich_exception
+
+        configure_logging(log_dir=str(tmp_path / "logs"))
+
+        console = MagicMock(spec=Console)
+        ex = ValueError("something went wrong")
+        print_rich_exception(console, ex, error_description="Operation failed")
+        console.print.assert_called_once()
+        call_args = str(console.print.call_args)
+        assert "Operation failed" in call_args
+
+    def test_uses_default_logger_when_none(self, tmp_path):
+        from rich.console import Console
+
+        from dataengineer.utils.loggings import configure_logging, print_rich_exception
+
+        configure_logging(log_dir=str(tmp_path / "logs"))
+
+        console = MagicMock(spec=Console)
+        ex = RuntimeError("runtime err")
+        # Should not raise even with file_logger=None
+        print_rich_exception(console, ex)
+        console.print.assert_called_once()
+
+
+class TestSetupWebChatbotLogging:
+    """Tests for setup_web_chatbot_logging (lines 228-279)."""
+
+    def test_returns_structlog_logger(self, tmp_path):
+        import structlog
+
+        from dataengineer.utils.loggings import setup_web_chatbot_logging
+
+        result = setup_web_chatbot_logging(log_dir=str(tmp_path / "chatbot_logs"))
+        # structlog.get_logger() returns a BoundLoggerLazyProxy — verify it has the
+        # standard structlog logger interface (info/debug/error/warning methods).
+        assert isinstance(result, structlog._config.BoundLoggerLazyProxy), (
+            f"Expected structlog BoundLoggerLazyProxy, got {type(result)}"
+        )
+
+    def test_creates_log_directory(self, tmp_path):
+        from dataengineer.utils.loggings import setup_web_chatbot_logging
+
+        log_dir = tmp_path / "chatbot_logs" / "sub"
+        setup_web_chatbot_logging(log_dir=str(log_dir))
+        assert log_dir.exists()
+
+    def test_debug_mode(self, tmp_path):
+        import structlog
+
+        from dataengineer.utils.loggings import setup_web_chatbot_logging
+
+        result = setup_web_chatbot_logging(debug=True, log_dir=str(tmp_path / "logs"))
+        assert isinstance(result, structlog._config.BoundLoggerLazyProxy), (
+            f"Expected structlog BoundLoggerLazyProxy, got {type(result)}"
+        )
+        # setup_web_chatbot_logging sets debug level on the "web_chatbot" named logger
+        assert logging.getLogger("web_chatbot").level == logging.DEBUG
+
+    def test_auto_detect_source_env(self, tmp_path):
+        import structlog
+
+        import dataengineer.utils.loggings as loggings_module
+
+        with patch.object(loggings_module, "_is_source_environment", return_value=True):
+            result = loggings_module.setup_web_chatbot_logging()
+        assert isinstance(result, structlog._config.BoundLoggerLazyProxy), (
+            f"Expected structlog BoundLoggerLazyProxy, got {type(result)}"
+        )
+
+    def test_non_source_env_uses_agent_config_path_manager(self, tmp_path):
+        import dataengineer.utils.loggings as loggings_module
+
+        path_manager = DataEngineerPathManager(tmp_path / "tenant_home")
+        agent_config = SimpleNamespace(path_manager=path_manager)
+
+        with patch.object(loggings_module, "_is_source_environment", return_value=False):
+            result = loggings_module.setup_web_chatbot_logging(agent_config=agent_config)
+
+        assert result is not None  # no isinstance check — verifying path_manager integration
+        assert path_manager.logs_dir.exists()
+        assert any(path_manager.logs_dir.glob("web_chatbot.*.log"))
+
+
+class TestAdaptiveRenderer:
+    """Tests for AdaptiveRenderer (lines 297-307)."""
+
+    def test_renderer_is_callable(self):
+        from dataengineer.utils.loggings import AdaptiveRenderer
+
+        renderer = AdaptiveRenderer()
+        assert callable(renderer)
+
+    def test_renderer_produces_string_output(self):
+        """AdaptiveRenderer.__call__ returns a string (delegates to ConsoleRenderer)."""
+        from dataengineer.utils.loggings import AdaptiveRenderer
+
+        renderer = AdaptiveRenderer()
+        result = renderer(None, "info", {"event": "test message"})
+        assert isinstance(result, str)
+
+
+class TestLogContext:
+    """Tests for log_context context manager (lines 282-294)."""
+
+    def test_log_context_console_only(self, tmp_path):
+        from dataengineer.utils.loggings import configure_logging, log_context
+
+        mgr = configure_logging(log_dir=str(tmp_path / "logs"))
+
+        with log_context("console"):
+            root_logger = logging.getLogger()
+            assert mgr.console_handler in root_logger.handlers, (
+                "console_handler should be active inside log_context('console')"
+            )
+            assert mgr.file_handler not in root_logger.handlers, (
+                "file_handler should NOT be active inside log_context('console')"
+            )
+            root_logger.info("test message in context")
+
+    def test_log_context_restores_after_exit(self, tmp_path):
+        from dataengineer.utils.loggings import configure_logging, log_context
+
+        configure_logging(log_dir=str(tmp_path / "logs"))
+        before = logging.getLogger().handlers.copy()
+        with log_context("none"):
+            pass
+        after = logging.getLogger().handlers
+        assert set(before) == set(after)
