@@ -1,0 +1,139 @@
+from unittest.mock import patch
+
+import pytest
+
+from dataengineer.cli.repl import DataEngineerCLI
+from tests.integration.conftest import wait_for_agent
+
+
+@pytest.mark.nightly
+class TestChatAgentic:
+    """N5: Chat agentic workflow tests."""
+
+    def test_multi_turn_context(self, mock_args):
+        """N5-02: Multi-turn dialogue preserves context."""
+        question1 = "How many schools are in Fresno county?"
+        question2 = "And how many in Alameda county?"
+
+        with patch("dataengineer.cli.repl.PromptSession.prompt") as mock_prompt:
+            mock_prompt.side_effect = [
+                f"/{question1}",
+                f"/{question2}",
+                EOFError,
+            ]
+            with (
+                patch("dataengineer.cli.repl.DataEngineerCLI.prompt_input") as mock_internal,
+                patch("dataengineer.cli.repl.AtReferenceCompleter.parse_at_context") as at_data,
+            ):
+                at_data.return_value = [], [], []
+                mock_internal.side_effect = ["n", "n"]
+                cli = DataEngineerCLI(args=mock_args)
+
+                wait_for_agent(cli)
+                cli.run()
+
+        actions = cli.actions.get_actions()
+        chat_responses = [a for a in actions if a.action_type == "chat_response"]
+        assert len(chat_responses) >= 2, f"Should have at least 2 chat responses for 2 turns, got {len(chat_responses)}"
+
+        # Both should be successful
+        for i, resp in enumerate(chat_responses):
+            assert resp.output.get("success") is True, f"Chat response {i + 1} should be successful"
+
+    def test_tool_call_combination(self, mock_args):
+        """N5-03: Tool call combination -- multiple tools used during execution."""
+        question = "What is the average SAT reading score for schools in Fresno county?"
+
+        with patch("dataengineer.cli.repl.PromptSession.prompt") as mock_prompt:
+            mock_prompt.side_effect = [f"/{question}", EOFError]
+            with (
+                patch("dataengineer.cli.repl.DataEngineerCLI.prompt_input") as mock_internal,
+                patch("dataengineer.cli.repl.AtReferenceCompleter.parse_at_context") as at_data,
+            ):
+                at_data.return_value = [], [], []
+                mock_internal.side_effect = ["n"]
+                cli = DataEngineerCLI(args=mock_args)
+
+                wait_for_agent(cli)
+                cli.run()
+
+        actions = cli.actions.get_actions()
+        chat_responses = [a for a in actions if a.action_type == "chat_response"]
+        assert len(chat_responses) == 1, f"Should have exactly one chat_response, got {len(chat_responses)}"
+
+        response = chat_responses[0]
+        assert response.output.get("success") is True, "Chat response should be successful"
+
+        tools_used = response.output.get("execution_stats", {}).get("tools_used", [])
+        assert len(tools_used) >= 2, f"Should use multiple tools, got: {tools_used}"
+
+    def test_streaming_response(self, mock_args):
+        """N5-05: Streaming response generates action sequence."""
+        question = "How many schools are there in Los Angeles county?"
+
+        with patch("dataengineer.cli.repl.PromptSession.prompt") as mock_prompt:
+            mock_prompt.side_effect = [f"/{question}", ".chat_info", EOFError]
+            with (
+                patch("dataengineer.cli.repl.DataEngineerCLI.prompt_input") as mock_internal,
+                patch("dataengineer.cli.repl.AtReferenceCompleter.parse_at_context") as at_data,
+            ):
+                at_data.return_value = [], [], []
+                mock_internal.side_effect = ["n"]
+                cli = DataEngineerCLI(args=mock_args)
+
+                wait_for_agent(cli)
+                cli.run()
+
+        actions = cli.actions.get_actions()
+        assert len(actions) > 0, "Should have action history"
+
+        # Verify action sequence includes chat_response
+        action_types = [a.action_type for a in actions]
+        assert "chat_response" in action_types, f"Should have chat_response action, got types: {action_types}"
+
+        # Verify session info
+        assert cli.chat_commands.current_node is not None, "Should have an active chat node"
+        import asyncio
+
+        session_info = asyncio.run(cli.chat_commands.current_node.get_session_info())
+        assert session_info.get("session_id"), "Should have a valid session ID"
+        assert session_info.get("action_count", 0) > 0, "Session should have recorded actions"
+
+    def test_single_turn_chat(self, mock_args):
+        """N5-01: Basic single-turn chat generates SQL and returns result."""
+        question = "List all schools in Fresno county"
+
+        with patch("dataengineer.cli.repl.PromptSession.prompt") as mock_prompt:
+            mock_prompt.side_effect = [f"/{question}", EOFError]
+            with (
+                patch("dataengineer.cli.repl.DataEngineerCLI.prompt_input") as mock_internal,
+                patch("dataengineer.cli.repl.AtReferenceCompleter.parse_at_context") as at_data,
+            ):
+                at_data.return_value = [], [], []
+                mock_internal.side_effect = ["n"]
+                cli = DataEngineerCLI(args=mock_args)
+
+                wait_for_agent(cli)
+                cli.run()
+
+        actions = cli.actions.get_actions()
+        chat_responses = [a for a in actions if a.action_type == "chat_response"]
+        assert len(chat_responses) == 1, f"Should have exactly one chat_response, got {len(chat_responses)}"
+
+        response = chat_responses[0]
+        assert response.output.get("success") is True, "Chat response should be successful"
+
+        # Verify by behavior, not response formatting: the agent must have actually
+        # executed a SQL query (tools_used contains read_query/run_query) AND the
+        # response must mention the subject ("fresno"). The chat node is free to
+        # present results as a markdown summary without quoting the SELECT verbatim,
+        # so asserting on the literal string "select" makes the test LLM-brittle.
+        execution_stats = response.output.get("execution_stats", {}) or {}
+        tools_used = execution_stats.get("tools_used", []) or []
+        assert any(t and ("query" in t.lower()) for t in tools_used), (
+            f"Agent should execute a SQL/query tool to answer the data question, tools_used: {tools_used}"
+        )
+        response_text = (response.output.get("response") or "").lower()
+        assert "fresno" in response_text, (
+            f"Response should reference 'Fresno' (the filter from the question), got response: {response_text[:500]}"
+        )
